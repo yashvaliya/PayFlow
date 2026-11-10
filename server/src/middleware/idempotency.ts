@@ -59,16 +59,26 @@ export function idempotency(operationName: string) {
         }
       }
 
-      // Create a locked record
-      await prisma.idempotencyRecord.create({
-        data: {
-          key: idempotencyKey,
-          operation: operationName,
-          requestHash,
-          requestPayload,
-          isLocked: true,
-        },
-      });
+      // Create a locked record (using try/catch to handle concurrent insert race)
+      try {
+        await prisma.idempotencyRecord.create({
+          data: {
+            key: idempotencyKey,
+            operation: operationName,
+            requestHash,
+            requestPayload,
+            isLocked: true,
+          },
+        });
+      } catch (createErr: any) {
+        // Handle unique constraint violation from concurrent request
+        if (createErr.code === 'P2002') {
+          throw new ConflictError(
+            `A request with Idempotency-Key "${idempotencyKey}" is currently being processed. Please retry shortly.`
+          );
+        }
+        throw createErr;
+      }
 
       // Intercept response to store result
       const originalJson = res.json.bind(res);
