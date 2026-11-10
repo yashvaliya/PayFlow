@@ -2,6 +2,87 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { prisma } from '../config/prisma.js';
 import { AppError, BadRequestError, ConflictError } from '../utils/errors.js';
+import { PaymentStatus } from '@prisma/client';
+
+/**
+ * Checks if the underlying operation already completed in the database.
+ * Prevents stale-lock recovery from re-executing an already-completed financial operation
+ * if response persistence failed previously.
+ */
+async function findCompletedOperationResponse(
+  operation: string,
+  key: string,
+  req: Request
+): Promise<{ status: number; body: any } | null> {
+  if (operation === 'CREATE_ORDER') {
+    const payment = await prisma.payment.findUnique({
+      where: { idempotencyKey: key },
+    });
+    if (payment) {
+      const rawData = payment.rawProviderData as any;
+      const approvalUrl = rawData?.links?.find((l: any) => l.rel === 'approve')?.href;
+      return {
+        status: 201,
+        body: {
+          success: true,
+          data: {
+            orderId: payment.orderId,
+            paymentId: payment.id,
+            amountMinor: payment.amountMinor,
+            currency: payment.currency,
+            status: payment.status,
+            approvalUrl,
+            payPalOrderId: payment.providerOrderId,
+          },
+        },
+      };
+    }
+  } else if (operation === 'CAPTURE_PAYMENT') {
+    const paymentId = req.params?.id;
+    if (paymentId) {
+      const payment = await prisma.payment.findUnique({
+        where: { id: paymentId },
+      });
+      if (
+        payment &&
+        (payment.status === PaymentStatus.COMPLETED ||
+          payment.status === PaymentStatus.REQUIRES_REVIEW ||
+          payment.status === PaymentStatus.REFUNDED ||
+          payment.status === PaymentStatus.PARTIALLY_REFUNDED)
+      ) {
+        return {
+          status: 200,
+          body: {
+            success: true,
+            message: 'Payment captured and settled successfully',
+            data: { payment },
+          },
+        };
+      }
+    }
+  } else if (operation === 'REFUND_PAYMENT') {
+    const refund = await prisma.refund.findUnique({
+      where: { idempotencyKey: key },
+    });
+    if (refund) {
+      const payment = await prisma.payment.findUnique({
+        where: { id: refund.paymentId },
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: 'Refund executed successfully',
+          data: {
+            refund,
+            payment,
+          },
+        },
+      };
+    }
+  }
+  return null;
+}
 
 /**
  * Recursively canonicalizes JSON data structures so identical objects
@@ -107,6 +188,26 @@ export function idempotency(operationName: string) {
             throw new ConflictError(
               `Idempotency-Key "${trimmedKey}" was previously used with a different request payload.`
             );
+          }
+
+          // If the underlying financial operation already succeeded (e.g. response persistence failed),
+          // do NOT execute the payment operation again. Replay the completed result directly.
+          const completed = await findCompletedOperationResponse(operationName, trimmedKey, req);
+          if (completed) {
+            await prisma.idempotencyRecord
+              .update({
+                where: { key: trimmedKey },
+                data: {
+                  isLocked: false,
+                  responseStatus: completed.status,
+                  responseBody: completed.body,
+                },
+              })
+              .catch(() => {});
+
+            res.setHeader('X-Idempotent-Replay', 'true');
+            res.status(completed.status).json(completed.body);
+            return;
           }
 
           // Atomic stale-lock recovery using conditional database update.

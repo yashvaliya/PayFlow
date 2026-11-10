@@ -177,6 +177,28 @@ describe('Idempotency Response Persistence', () => {
       where: { customerEmail: email },
     });
     expect(ordersAfter).toBe(ordersBefore);
+
+    // Test retrying after the 30-second lock expiry (stale-lock recovery)
+    await prisma.idempotencyRecord.update({
+      where: { key },
+      data: { lockedAt: new Date(Date.now() - 60_000) },
+    });
+
+    const res3 = await request(app)
+      .post('/api/payments/orders')
+      .set('Idempotency-Key', key)
+      .send(payload);
+
+    // Stale-lock recovery must NOT duplicate the payment operation; it safely replays the completed result
+    expect(res3.status).toBe(201);
+    expect(res3.headers['x-idempotent-replay']).toBe('true');
+    expect(res3.body.data.orderId).toBeDefined();
+
+    // Verify order count is STILL exactly 1 (no duplicate operation occurred after lock expiry)
+    const ordersFinal = await prisma.order.count({
+      where: { customerEmail: email },
+    });
+    expect(ordersFinal).toBe(ordersBefore);
   });
 
   // =========================================================================
@@ -209,7 +231,8 @@ describe('Idempotency Response Persistence', () => {
   // =========================================================================
   it('rejects concurrent requests with the same idempotency key', async () => {
     const key = `persist-conc-${Date.now()}`;
-    const payload = makePayload('persist-conc@example.com');
+    const email = `persist-conc-${Date.now()}@example.com`;
+    const payload = makePayload(email);
 
     const [res1, res2] = await Promise.all([
       request(app)
@@ -224,8 +247,16 @@ describe('Idempotency Response Persistence', () => {
 
     const statuses = [res1.status, res2.status].sort();
 
-    // One must succeed (201), the other must get conflict (409)
-    expect(statuses).toEqual([201, 409]);
+    // One request must succeed with 201. The other either gets 409 Conflict (if in-flight)
+    // or safely replays with 201 (if the first finished persisting before the second claimed)
+    expect(statuses[0]).toBe(201);
+    expect([201, 409]).toContain(statuses[1]);
+
+    // Crucially: exactly one order exists in the database — no duplicate financial operations
+    const orderCount = await prisma.order.count({
+      where: { customerEmail: email },
+    });
+    expect(orderCount).toBe(1);
 
     const record = await prisma.idempotencyRecord.findUnique({ where: { key } });
     expect(record).toBeDefined();
