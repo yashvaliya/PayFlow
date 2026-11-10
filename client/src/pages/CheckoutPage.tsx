@@ -20,7 +20,6 @@ import {
 } from 'lucide-react';
 
 export const CheckoutPage: React.FC = () => {
-
   // 1. Fetch authoritative products from PostgreSQL
   const { data: productsData, isLoading: isProductsLoading } = useQuery({
     queryKey: ['products'],
@@ -69,7 +68,6 @@ export const CheckoutPage: React.FC = () => {
     });
   };
 
-  // Authoritative total calculated client-side purely for display; backend recalculates authoritatively
   const displayTotalMinor = Object.entries(cart).reduce((sum, [productId, qty]) => {
     const prod = products.find((p) => p.id === productId);
     return sum + (prod ? prod.unitAmountMinor * qty : 0);
@@ -89,7 +87,7 @@ export const CheckoutPage: React.FC = () => {
       }));
 
       if (items.length === 0) {
-        throw new Error('Please select at least one product to checkout');
+        throw new Error('Please select at least one item');
       }
 
       const idempotencyKey = generateIdempotencyKey('IDEM-ORD');
@@ -140,97 +138,89 @@ export const CheckoutPage: React.FC = () => {
   };
 
   return (
-    <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+    <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
       {/* Header */}
       <div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-bold uppercase tracking-wider text-primary">
-            PayPal Sandbox Store
-          </span>
-          <span className="text-[10px] font-mono bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold px-2 py-0.5 rounded-full">
-            REST v2 Integration
-          </span>
-        </div>
-        <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-foreground mt-1">
-          Checkout &amp; Settle
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">
+          Checkout &amp; Settlement
         </h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          Pick an item to test the checkout flow, create a PayPal order, and see the state machine advance to captured and settled.
+        <p className="text-xs text-muted-foreground mt-1">
+          Select items to test the full payment lifecycle: order creation, PayPal capture, and double-entry ledger posting.
         </p>
       </div>
 
       {errorMsg && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-700 dark:text-rose-400 text-sm flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+        <div className="p-3.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-700 dark:text-rose-400 text-xs flex items-start gap-2.5">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <div className="flex-1">
-            <span className="font-semibold">Transaction Error:</span> {errorMsg}
+            <span className="font-semibold">Error:</span> {errorMsg}
           </div>
         </div>
       )}
 
       {/* Confirmation View when Captured */}
       {capturedPayment ? (
-        <div className="p-8 rounded-3xl bg-card border border-emerald-500/30 shadow-lg text-center max-w-2xl mx-auto space-y-6">
-          <div className="w-16 h-16 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mx-auto">
-            <CheckCircle2 className="w-8 h-8" />
+        <div className="p-6 sm:p-8 rounded-xl bg-card border border-border shadow-sm text-center max-w-xl mx-auto space-y-6">
+          <div className="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mx-auto">
+            <CheckCircle2 className="w-6 h-6" />
           </div>
 
           <div>
-            <span className="text-xs font-bold text-emerald-600 uppercase tracking-widest">
-              Confirmed &amp; Settled
-            </span>
-            <h2 className="text-2xl font-extrabold text-foreground mt-1">
-              Payment Successfully Captured!
+            <div className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">
+              Settlement Completed
+            </div>
+            <h2 className="text-xl font-bold text-foreground mt-1">
+              Payment Confirmed &amp; Posted
             </h2>
-            <p className="text-sm text-muted-foreground mt-2">
-              The double-entry ledger has been updated, and debit/credit journals have been posted atomically.
+            <p className="text-xs text-muted-foreground mt-1.5">
+              The double-entry journal has been recorded in the ledger atomically.
             </p>
           </div>
 
           {/* Details table */}
-          <div className="bg-muted/40 rounded-2xl p-4 text-left text-xs font-mono space-y-2 border border-border">
+          <div className="bg-secondary/40 rounded-lg p-3.5 text-left text-xs font-mono space-y-2 border border-border">
             <div className="flex justify-between py-1 border-b border-border/50">
-              <span className="text-muted-foreground font-sans">Internal Payment ID:</span>
-              <span className="font-semibold text-foreground truncate max-w-xs">{capturedPayment.id}</span>
+              <span className="text-muted-foreground font-sans">Payment ID:</span>
+              <span className="font-semibold text-foreground truncate max-w-[200px]">{capturedPayment.id}</span>
             </div>
             <div className="flex justify-between py-1 border-b border-border/50">
               <span className="text-muted-foreground font-sans">PayPal Order ID:</span>
               <span className="font-semibold text-foreground">{capturedPayment.providerOrderId}</span>
             </div>
             <div className="flex justify-between py-1 border-b border-border/50">
-              <span className="text-muted-foreground font-sans">PayPal Capture ID:</span>
-              <span className="font-semibold text-emerald-600 dark:text-emerald-400">
+              <span className="text-muted-foreground font-sans">Capture Reference:</span>
+              <span className="font-semibold text-foreground">
                 {capturedPayment.providerCaptureId || 'CAP-CONFIRMED'}
               </span>
             </div>
             <div className="flex justify-between py-1 border-b border-border/50">
-              <span className="text-muted-foreground font-sans">Total Amount:</span>
-              <span className="font-bold text-foreground text-sm font-sans">
+              <span className="text-muted-foreground font-sans">Total Paid:</span>
+              <span className="font-bold text-foreground font-sans">
                 {formatCents(capturedPayment.amountMinor)}
               </span>
             </div>
             <div className="flex justify-between py-1">
-              <span className="text-muted-foreground font-sans">Ledger Journals Created:</span>
-              <span className="font-bold text-blue-600 dark:text-blue-400 font-sans">
+              <span className="text-muted-foreground font-sans">Ledger Journals:</span>
+              <span className="font-semibold text-blue-600 dark:text-blue-400 font-sans">
                 {capturedPayment.ledgerJournals?.length || 1} Journal Posted
               </span>
             </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-3 justify-center pt-2">
+          <div className="flex flex-col sm:flex-row gap-2.5 justify-center pt-2">
             <Link
               to={`/transactions/${capturedPayment.id}`}
-              className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground font-semibold text-sm flex items-center justify-center gap-2 hover:opacity-90 shadow-sm"
+              className="px-4 py-2 rounded-lg bg-foreground text-background font-semibold text-xs flex items-center justify-center gap-1.5 hover:opacity-90"
             >
-              <span>Inspect Transaction &amp; Ledger</span>
-              <ArrowRight className="w-4 h-4" />
+              <span>View Transaction &amp; Ledger</span>
+              <ArrowRight className="w-3.5 h-3.5" />
             </Link>
             <button
               onClick={resetCheckout}
-              className="px-5 py-2.5 rounded-xl bg-secondary hover:bg-secondary/80 text-foreground font-semibold text-sm flex items-center justify-center gap-2"
+              className="px-4 py-2 rounded-lg border border-border bg-card hover:bg-secondary text-foreground font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors"
             >
-              <RefreshCw className="w-4 h-4" />
-              <span>Checkout Another Item</span>
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Checkout Again</span>
             </button>
           </div>
         </div>
@@ -239,64 +229,66 @@ export const CheckoutPage: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
           {/* Left: Product Selection */}
           <div className="lg:col-span-7 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-base font-bold text-foreground flex items-center gap-2">
-                <ShoppingBag className="w-4 h-4 text-primary" />
-                <span>Select Products</span>
+            <div className="flex items-center justify-between pb-1 border-b border-border">
+              <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
+                <ShoppingBag className="w-4 h-4 text-muted-foreground" />
+                <span>Available Items</span>
               </h2>
-              <span className="text-xs text-muted-foreground">
-                Authoritative pricing from PostgreSQL
+              <span className="text-[11px] text-muted-foreground">
+                Authoritative pricing in Postgres
               </span>
             </div>
 
             {isProductsLoading ? (
-              <div className="p-8 text-center text-xs text-muted-foreground bg-card rounded-2xl border border-border">
-                Loading products...
+              <div className="p-8 text-center text-xs text-muted-foreground bg-card rounded-lg border border-border">
+                Loading product catalog...
               </div>
             ) : (
-              <div className="space-y-3">
+              <div className="space-y-2.5">
                 {products.map((product) => {
                   const qty = cart[product.id] || 0;
                   return (
                     <div
                       key={product.id}
-                      className={`p-4 rounded-2xl border transition-all ${
+                      className={`p-3.5 rounded-lg border transition-all ${
                         qty > 0
-                          ? 'bg-card border-primary/50 shadow-sm ring-1 ring-primary/20'
-                          : 'bg-card/60 border-border hover:border-border/80'
+                          ? 'bg-card border-foreground/30 shadow-xs'
+                          : 'bg-card/40 border-border hover:border-border/80'
                       }`}
                     >
                       <div className="flex items-start justify-between gap-4">
-                        <div className="flex-1">
+                        <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2">
-                            <h3 className="text-sm font-bold text-foreground">{product.name}</h3>
-                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-muted text-muted-foreground">
+                            <h3 className="text-xs font-semibold text-foreground truncate">{product.name}</h3>
+                            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-secondary text-muted-foreground">
                               {product.sku}
                             </span>
                           </div>
-                          <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                          <p className="text-[11px] text-muted-foreground mt-0.5 leading-relaxed line-clamp-2">
                             {product.description}
                           </p>
-                          <div className="mt-2 text-sm font-extrabold text-foreground">
+                          <div className="mt-1.5 text-xs font-bold text-foreground">
                             {formatCents(product.unitAmountMinor)}
                           </div>
                         </div>
 
                         {/* Quantity Counter */}
-                        <div className="flex items-center gap-2 shrink-0 bg-muted/70 p-1 rounded-xl border border-border">
+                        <div className="flex items-center gap-1.5 shrink-0 bg-secondary/80 p-0.5 rounded-md border border-border">
                           <button
                             onClick={() => updateQuantity(product.id, -1)}
                             disabled={qty === 0}
-                            className="p-1 rounded-lg text-muted-foreground hover:text-foreground hover:bg-card disabled:opacity-30 disabled:hover:bg-transparent"
+                            className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-card disabled:opacity-30 disabled:hover:bg-transparent"
+                            aria-label="Decrease quantity"
                           >
-                            <Minus className="w-3.5 h-3.5" />
+                            <Minus className="w-3 h-3" />
                           </button>
-                          <span className="w-6 text-center font-bold text-xs">{qty}</span>
+                          <span className="w-5 text-center font-semibold text-xs">{qty}</span>
                           <button
                             onClick={() => updateQuantity(product.id, 1)}
-                            className="p-1 rounded-lg text-muted-foreground hover:text-foreground hover:bg-card"
+                            className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-card"
+                            aria-label="Increase quantity"
                           >
-                            <Plus className="w-3.5 h-3.5" />
+                            <Plus className="w-3 h-3" />
                           </button>
                         </div>
                       </div>
@@ -309,50 +301,46 @@ export const CheckoutPage: React.FC = () => {
 
           {/* Right: Order Summary & PayPal Button */}
           <div className="lg:col-span-5 space-y-4">
-            <div className="p-6 rounded-3xl bg-card border border-border shadow-sm space-y-6">
-              <h2 className="text-base font-bold text-foreground">Order Summary &amp; Checkout</h2>
+            <div className="p-5 rounded-xl bg-card border border-border shadow-xs space-y-4">
+              <h2 className="text-sm font-semibold text-foreground pb-2 border-b border-border">Order Summary</h2>
 
               {/* Customer Info Form */}
-              <div className="space-y-3">
+              <div className="space-y-2.5">
                 <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Customer Name</label>
+                  <label className="text-[11px] font-medium text-muted-foreground">Customer Name</label>
                   <input
                     type="text"
                     value={customerName}
                     onChange={(e) => setCustomerName(e.target.value)}
-                    className="mt-1 w-full px-3 py-2 rounded-xl bg-background border border-input text-xs text-foreground focus:ring-1 focus:ring-primary outline-none"
+                    className="mt-1 w-full px-2.5 py-1.5 rounded-md bg-background border border-input text-xs text-foreground focus:ring-1 focus:ring-primary outline-none"
                     placeholder="Full Name"
                   />
                 </div>
                 <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Buyer Email Address</label>
+                  <label className="text-[11px] font-medium text-muted-foreground">Customer Email</label>
                   <input
                     type="email"
                     value={customerEmail}
                     onChange={(e) => setCustomerEmail(e.target.value)}
-                    className="mt-1 w-full px-3 py-2 rounded-xl bg-background border border-input text-xs text-foreground focus:ring-1 focus:ring-primary outline-none"
+                    className="mt-1 w-full px-2.5 py-1.5 rounded-md bg-background border border-input text-xs text-foreground focus:ring-1 focus:ring-primary outline-none"
                     placeholder="email@example.com"
                   />
                 </div>
               </div>
 
               {/* Pricing breakdown */}
-              <div className="pt-4 border-t border-border space-y-2 text-xs">
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Selected Items ({cartItemCount})</span>
+              <div className="pt-3 border-t border-border space-y-1.5 text-xs">
+                <div className="flex justify-between text-muted-foreground text-[11px]">
+                  <span>Items ({cartItemCount})</span>
                   <span>{formatCents(displayTotalMinor)}</span>
                 </div>
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Payment Gateway Processing</span>
-                  <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Free (Sandbox)</span>
-                </div>
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Idempotency Protection</span>
-                  <span className="text-blue-600 dark:text-blue-400 font-mono text-[11px]">ENFORCED</span>
+                <div className="flex justify-between text-muted-foreground text-[11px]">
+                  <span>Processing Fee</span>
+                  <span className="text-emerald-600 dark:text-emerald-400 font-medium">Free (Sandbox)</span>
                 </div>
                 <div className="pt-2 border-t border-border flex justify-between items-baseline">
-                  <span className="font-bold text-foreground text-sm">Authoritative Total</span>
-                  <span className="font-extrabold text-xl text-foreground">
+                  <span className="font-semibold text-foreground text-xs">Total Due</span>
+                  <span className="font-extrabold text-base text-foreground font-mono">
                     {formatCents(displayTotalMinor)}
                   </span>
                 </div>
@@ -363,29 +351,29 @@ export const CheckoutPage: React.FC = () => {
                 <button
                   onClick={handleInitiatePayment}
                   disabled={cartItemCount === 0 || isCreatingOrder}
-                  className="w-full py-3.5 px-4 rounded-xl bg-primary text-primary-foreground font-semibold text-sm flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-50 transition-all shadow-md shadow-primary/20"
+                  className="w-full py-2.5 px-4 rounded-lg bg-foreground text-background font-semibold text-xs flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-50 transition-opacity"
                 >
                   {isCreatingOrder ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Creating Authoritative Order...</span>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Creating Order...</span>
                     </>
                   ) : (
                     <>
-                      <CreditCard className="w-4 h-4" />
-                      <span>Proceed to PayPal Sandbox Checkout</span>
+                      <CreditCard className="w-3.5 h-3.5" />
+                      <span>Create PayPal Order</span>
                     </>
                   )}
                 </button>
               ) : (
                 /* Step 2: PayPal Order Created -> Execute Sandbox Capture */
-                <div className="space-y-4 pt-2">
-                  <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 text-xs space-y-1">
-                    <div className="flex items-center justify-between font-semibold text-blue-700 dark:text-blue-300">
-                      <span>PayPal Order Created:</span>
-                      <span className="font-mono">{createdOrderData.providerOrderId}</span>
+                <div className="space-y-3 pt-1">
+                  <div className="p-3 rounded-lg bg-secondary/60 border border-border text-xs space-y-1 font-mono">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground font-sans">PayPal Order:</span>
+                      <span className="font-semibold text-foreground">{createdOrderData.providerOrderId}</span>
                     </div>
-                    <div className="text-[11px] text-muted-foreground">
+                    <div className="text-[11px] text-muted-foreground font-sans">
                       Status: <StatusBadge status="PENDING_APPROVAL" size="sm" />
                     </div>
                   </div>
@@ -396,27 +384,27 @@ export const CheckoutPage: React.FC = () => {
                         href={createdOrderData.approvalUrl}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="w-full py-2.5 px-4 rounded-xl bg-[#0070ba] hover:bg-[#005ea6] text-white font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition-colors"
+                        className="w-full py-2 px-3 rounded-md bg-[#0070ba] hover:bg-[#005ea6] text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors"
                       >
-                        <span>Approve on PayPal Sandbox Modal</span>
-                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>Approve on PayPal Sandbox</span>
+                        <ExternalLink className="w-3 h-3" />
                       </a>
                     )}
 
                     <button
                       onClick={handleCapturePayment}
                       disabled={isCapturing}
-                      className="w-full py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-md shadow-emerald-600/20 transition-all"
+                      className="w-full py-2.5 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors"
                     >
                       {isCapturing ? (
                         <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span>Authorizing &amp; Capturing Payment...</span>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Capturing &amp; Settling...</span>
                         </>
                       ) : (
                         <>
-                          <ShieldCheck className="w-5 h-5" />
-                          <span>Confirm Sandbox Capture &amp; Settle</span>
+                          <ShieldCheck className="w-4 h-4" />
+                          <span>Capture Payment &amp; Post to Ledger</span>
                         </>
                       )}
                     </button>
@@ -424,9 +412,9 @@ export const CheckoutPage: React.FC = () => {
                 </div>
               )}
 
-              <div className="flex items-center justify-center gap-2 text-[11px] text-muted-foreground text-center">
-                <Lock className="w-3.5 h-3.5 text-emerald-500" />
-                <span>Zero client price trust. All charges verified by backend.</span>
+              <div className="flex items-center justify-center gap-1.5 text-[10px] text-muted-foreground text-center pt-1">
+                <Lock className="w-3 h-3 text-muted-foreground" />
+                <span>Idempotency-Key header attached to all requests</span>
               </div>
             </div>
           </div>
