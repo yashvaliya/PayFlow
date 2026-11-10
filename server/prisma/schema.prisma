@@ -1,0 +1,347 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN
+  VIEWER
+}
+
+enum OrderStatus {
+  DRAFT
+  PENDING
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING_APPROVAL
+  APPROVED
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUND_PENDING
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum EntryType {
+  DEBIT
+  CREDIT
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum ReconciliationOutcome {
+  MATCHED
+  INTERNAL_MISMATCH
+  PROVIDER_MISMATCH
+  PENDING_REVIEW
+}
+
+enum ReconciliationRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role     @default(VIEWER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  auditLogs         AuditLog[]
+  reconciliationRuns ReconciliationRun[]
+
+  @@map("users")
+}
+
+model Product {
+  id               String      @id @default(uuid())
+  name             String
+  sku              String      @unique
+  description      String
+  unitAmountMinor  Int         // stored in cents (e.g., 2999 = $29.99)
+  currency         String      @default("USD")
+  stock            Int         @default(100)
+  imageUrl         String?
+  isActive         Boolean     @default(true)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  orderItems       OrderItem[]
+
+  @@map("products")
+}
+
+model Order {
+  id               String       @id @default(uuid())
+  orderNumber      String       @unique
+  customerEmail    String
+  customerName     String
+  totalAmountMinor Int
+  currency         String       @default("USD")
+  status           OrderStatus  @default(PENDING)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  items            OrderItem[]
+  payments         Payment[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id               String   @id @default(uuid())
+  orderId          String
+  productId        String
+  quantity         Int
+  unitAmountMinor  Int
+  totalAmountMinor Int
+  createdAt        DateTime @default(now())
+
+  order            Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product          Product  @relation(fields: [productId], references: [id])
+
+  @@map("order_items")
+}
+
+model Payment {
+  id                  String         @id @default(uuid())
+  orderId             String
+  idempotencyKey      String         @unique
+  provider            String         @default("PAYPAL")
+  providerOrderId     String?        @unique // PayPal Order ID
+  providerCaptureId   String?        @unique // PayPal Capture ID
+  amountMinor         Int
+  refundedAmountMinor Int            @default(0)
+  currency            String         @default("USD")
+  status              PaymentStatus  @default(CREATED)
+  providerStatus      String?
+  failureReason       String?
+  rawProviderData     Json?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  completedAt         DateTime?
+
+  order               Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  refunds             Refund[]
+  stateTransitions    PaymentStateTransition[]
+  reconciliationItems ReconciliationItem[]
+
+  @@index([providerOrderId])
+  @@index([providerCaptureId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+model PaymentStateTransition {
+  id          String        @id @default(uuid())
+  paymentId   String
+  fromStatus  PaymentStatus
+  toStatus    PaymentStatus
+  reason      String?
+  triggeredBy String        @default("SYSTEM") // SYSTEM, USER, WEBHOOK
+  metadata    Json?
+  createdAt   DateTime      @default(now())
+
+  payment     Payment       @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@map("payment_state_transitions")
+}
+
+model Refund {
+  id               String       @id @default(uuid())
+  paymentId        String
+  idempotencyKey   String       @unique
+  providerRefundId String?      @unique // PayPal Refund ID
+  amountMinor      Int
+  currency         String       @default("USD")
+  reason           String?
+  status           RefundStatus @default(PENDING)
+  rawProviderData  Json?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  payment          Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([paymentId])
+  @@index([providerRefundId])
+  @@map("refunds")
+}
+
+model IdempotencyRecord {
+  id             String    @id @default(uuid())
+  key            String    @unique
+  operation      String    // CREATE_ORDER, CAPTURE_PAYMENT, REFUND_PAYMENT
+  requestHash    String
+  requestPayload Json?
+  responseStatus Int?
+  responseBody   Json?
+  isLocked       Boolean   @default(true)
+  lockedAt       DateTime  @default(now())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([key])
+  @@map("idempotency_records")
+}
+
+model LedgerAccount {
+  id           String      @id @default(uuid())
+  code         String      @unique // PAYPAL_CLEARING, MERCHANT_PAYABLE, etc.
+  name         String
+  type         AccountType
+  balanceMinor Int         @default(0)
+  currency     String      @default("USD")
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  entries      LedgerEntry[]
+
+  @@map("ledger_accounts")
+}
+
+model LedgerJournal {
+  id            String        @id @default(uuid())
+  journalNumber String        @unique
+  referenceType String        // PAYMENT_CAPTURE, PAYMENT_REFUND, ADJUSTMENT
+  referenceId   String        // e.g. paymentId or refundId
+  description   String
+  postedAt      DateTime      @default(now())
+  createdAt     DateTime      @default(now())
+
+  entries       LedgerEntry[]
+
+  @@index([referenceType, referenceId])
+  @@map("ledger_journals")
+}
+
+model LedgerEntry {
+  id          String        @id @default(uuid())
+  journalId   String
+  accountId   String
+  entryType   EntryType
+  amountMinor Int           // positive integer
+  currency    String        @default("USD")
+  createdAt   DateTime      @default(now())
+
+  journal     LedgerJournal @relation(fields: [journalId], references: [id], onDelete: Cascade)
+  account     LedgerAccount @relation(fields: [accountId], references: [id])
+
+  @@index([journalId])
+  @@index([accountId])
+  @@map("ledger_entries")
+}
+
+model WebhookEvent {
+  id                 String        @id @default(uuid())
+  eventId            String        @unique // PayPal Webhook Event ID
+  eventType          String        // e.g. PAYMENT.CAPTURE.COMPLETED
+  resourceType       String?
+  summary            String?
+  payload            Json
+  status             WebhookStatus @default(PENDING)
+  processingAttempts Int           @default(0)
+  lastError          String?
+  receivedAt         DateTime      @default(now())
+  processedAt        DateTime?
+
+  @@index([eventId])
+  @@index([eventType])
+  @@index([status])
+  @@map("webhook_events")
+}
+
+model ReconciliationRun {
+  id                String                  @id @default(uuid())
+  runNumber         String                  @unique
+  status            ReconciliationRunStatus @default(RUNNING)
+  totalChecked      Int                     @default(0)
+  matchedCount      Int                     @default(0)
+  mismatchedCount   Int                     @default(0)
+  pendingReviewCount Int                    @default(0)
+  startedAt         DateTime                @default(now())
+  completedAt       DateTime?
+  triggeredByUserId String?
+  notes             String?
+
+  triggeredBy       User?                   @relation(fields: [triggeredByUserId], references: [id])
+  items             ReconciliationItem[]
+
+  @@map("reconciliation_runs")
+}
+
+model ReconciliationItem {
+  id                   String                @id @default(uuid())
+  runId                String
+  paymentId            String?
+  providerOrderId      String?
+  providerCaptureId    String?
+  internalStatus       PaymentStatus?
+  providerStatus       String?
+  internalAmountMinor  Int?
+  providerAmountMinor  Int?
+  statusMatch          Boolean               @default(false)
+  amountMatch          Boolean               @default(false)
+  outcome              ReconciliationOutcome
+  details              Json?
+  createdAt            DateTime              @default(now())
+
+  run                  ReconciliationRun     @relation(fields: [runId], references: [id], onDelete: Cascade)
+  payment              Payment?              @relation(fields: [paymentId], references: [id])
+
+  @@index([runId])
+  @@index([paymentId])
+  @@map("reconciliation_items")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  changes    Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@map("audit_logs")
+}

@@ -1,0 +1,57 @@
+name: PayFlow CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-and-build:
+    name: Lint, Test & Build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payflow_ci
+          POSTGRES_PASSWORD: payflow_ci_password
+          POSTGRES_DB: payflow_ci_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Monorepo Dependencies
+        run: npm ci
+
+      - name: Setup Prisma Database Schema
+        env:
+          DATABASE_URL: "postgresql://payflow_ci:payflow_ci_password@localhost:5432/payflow_ci_db?schema=public"
+        run: |
+          cd server
+          npx prisma db push
+          npm run prisma:seed
+
+      - name: Execute Vitest Test Suite
+        env:
+          DATABASE_URL: "postgresql://payflow_ci:payflow_ci_password@localhost:5432/payflow_ci_db?schema=public"
+          JWT_SECRET: "ci_jwt_secret_for_automated_testing_min_32_characters"
+        run: npm run test --workspace=server
+
+      - name: Compile Server & Client Bundles
+        run: npm run build

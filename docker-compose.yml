@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: payflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payflow_user
+      POSTGRES_PASSWORD: payflow_secure_password
+      POSTGRES_DB: payflow
+    ports:
+      - "5434:5432"
+    volumes:
+      - payflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payflow_user -d payflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payflow-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      DATABASE_URL: "postgresql://payflow_user:payflow_secure_password@db:5432/payflow?schema=public"
+      JWT_SECRET: "payflow_production_secure_jwt_secret_min_32_chars_long"
+      SESSION_SECRET: "payflow_production_secure_session_secret_min_32_chars_long"
+      PAYPAL_MODE: "sandbox"
+      PAYPAL_CLIENT_ID: "${PAYPAL_CLIENT_ID:-}"
+      PAYPAL_CLIENT_SECRET: "${PAYPAL_CLIENT_SECRET:-}"
+      PAYPAL_WEBHOOK_ID: "${PAYPAL_WEBHOOK_ID:-}"
+
+volumes:
+  payflow_pgdata:
