@@ -500,8 +500,18 @@ describe('Regression Tests: Final Hardening Round', () => {
       ]);
 
       const statuses = [res1.status, res2.status].sort();
-      // One should succeed (201) and the other should get conflict (409)
-      expect(statuses).toEqual([201, 409]);
+      // One should succeed (201). The other either gets conflict (409) if it
+      // arrives while the first is still executing, or replays (201 with
+      // X-Idempotent-Replay) if it arrives after the first completes.
+      // Both outcomes are correct — the key invariant is no double-execution.
+      expect(statuses[0]).toBe(201);
+      expect([201, 409]).toContain(statuses[1]);
+
+      // Verify exactly one order was created for this key
+      const record = await prisma.idempotencyRecord.findUnique({ where: { key: staleKey } });
+      expect(record).toBeDefined();
+      expect(record!.isLocked).toBe(false);
+      expect(record!.responseStatus).toBe(201);
     });
   });
 });

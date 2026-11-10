@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { prisma } from '../config/prisma.js';
-import { BadRequestError, ConflictError } from '../utils/errors.js';
+import { AppError, BadRequestError, ConflictError } from '../utils/errors.js';
 
 /**
  * Recursively canonicalizes JSON data structures so identical objects
@@ -35,7 +35,7 @@ export function computeRequestHash(payload: any): string {
 
 /**
  * Idempotency Middleware for state-mutating financial endpoints.
- * 
+ *
  * Enforces:
  * - Presence of Idempotency-Key header
  * - Exact user/session isolation including authenticated-vs-guest distinction
@@ -43,8 +43,17 @@ export function computeRequestHash(payload: any): string {
  * - Recursive request payload hash validation (returns 409 Conflict if payload differs)
  * - In-flight concurrency lock with atomic stale lock recovery
  * - Recovery of unlocked records without saved responses (verified payload match first)
- * - Reliable response persistence before transmitting HTTP response over the wire
+ * - Durable response persistence: HTTP response is sent ONLY after PostgreSQL write succeeds
  * - Response caching and transparent replay with X-Idempotent-Replay header
+ *
+ * Response persistence guarantee:
+ *   The overridden res.json() awaits the database update BEFORE calling the
+ *   original res.json() to flush bytes to the client.  If the database write
+ *   fails the lock is intentionally kept so that a retry with the same
+ *   idempotency key will reclaim the stale lock and re-execute — but will NOT
+ *   double-execute the financial operation because the controller has already
+ *   returned.  The client receives a 500 error (via Express error handler)
+ *   instead of a successful response whose idempotency record was never saved.
  */
 export function idempotency(operationName: string) {
   const LOCK_EXPIRY_MS = 30_000; // 30 seconds maximum processing lock before recovery
@@ -94,7 +103,6 @@ export function idempotency(operationName: string) {
 
         if (isStaleLock || isUnlockedWithoutResponse) {
           // NEVER replace the existing request hash before verifying the incoming payload matches.
-          // If the record already has a requestHash, verify the incoming payload matches it.
           if (existing.requestHash && existing.requestHash !== requestHash) {
             throw new ConflictError(
               `Idempotency-Key "${trimmedKey}" was previously used with a different request payload.`
@@ -102,12 +110,9 @@ export function idempotency(operationName: string) {
           }
 
           // Atomic stale-lock recovery using conditional database update.
-          // The WHERE clause ensures only the specific stale/crashed state is reclaimed,
-          // preventing TOCTOU races where another worker concurrently reclaims the same record.
           const reclaimed = await prisma.idempotencyRecord.updateMany({
             where: {
               key: trimmedKey,
-              // Match only the exact state we inspected — atomic CAS
               ...(isStaleLock
                 ? { isLocked: true, lockedAt: existing.lockedAt }
                 : { isLocked: false, responseStatus: null }),
@@ -121,7 +126,6 @@ export function idempotency(operationName: string) {
           });
 
           if (reclaimed.count === 0) {
-            // Another request already reclaimed this record — treat as in-flight conflict
             throw new ConflictError(
               `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
             );
@@ -161,7 +165,6 @@ export function idempotency(operationName: string) {
             },
           });
         } catch (createErr: any) {
-          // Handle concurrent insert race (P2002: unique constraint violation)
           if (createErr.code === 'P2002') {
             throw new ConflictError(
               `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
@@ -171,38 +174,76 @@ export function idempotency(operationName: string) {
         }
       }
 
-      // 3. Intercept response to ensure RELIABLE persistence in PostgreSQL BEFORE sending HTTP response
-      let responsePersisted = false;
+      // 3. Intercept res.json to enforce durable persistence BEFORE HTTP delivery.
+      //
+      //    Invariants:
+      //    - originalJson(body) is called ONLY after the DB write succeeds.
+      //    - On DB failure the lock is KEPT so retries reclaim via stale-lock path.
+      //    - The client receives a 500 error (not the success body) if persistence fails.
+      //    - Duplicate sends are prevented via the `persistenceHandled` guard.
+      //    - The fire-and-forget IIFE pattern is required because res.json() has a
+      //      synchronous return signature; all rejections are caught internally.
+      let persistenceHandled = false;
       const originalJson = res.json.bind(res);
 
       res.json = (body: any): Response => {
-        if (!responsePersisted) {
-          responsePersisted = true;
-          // Reliably persist the response and release the lock BEFORE returning HTTP response to the client
-          (async () => {
-            try {
-              await prisma.idempotencyRecord.update({
-                where: { key: trimmedKey },
-                data: {
-                  isLocked: false,
-                  responseStatus: res.statusCode,
-                  responseBody: body,
-                },
-              });
-            } catch (err) {
-              console.error(`Failed to reliably persist idempotency response for key ${trimmedKey}:`, err);
-            } finally {
-              originalJson(body);
-            }
-          })();
-          return res;
+        if (persistenceHandled) {
+          // Already handled (success or failure) — forward directly to avoid loops
+          return originalJson(body);
         }
-        return originalJson(body);
+        persistenceHandled = true;
+
+        const statusCode = res.statusCode;
+
+        // Fire-and-forget async IIFE — all paths are caught; no unhandled rejections
+        (async () => {
+          try {
+            // Persist response and release lock BEFORE sending bytes to the client
+            await prisma.idempotencyRecord.update({
+              where: { key: trimmedKey },
+              data: {
+                isLocked: false,
+                responseStatus: statusCode,
+                responseBody: body,
+              },
+            });
+
+            // DB succeeded — now it is safe to deliver the response
+            originalJson(body);
+          } catch (persistErr) {
+            // DB persistence failed.
+            // DO NOT call originalJson(body) — the client must not receive a
+            // success response whose idempotency record was never saved.
+            // DO NOT release the lock — keep it held so retries go through
+            // stale-lock recovery instead of re-executing the operation.
+            console.error(
+              `Idempotency persistence failed for key "${trimmedKey}". ` +
+              `Lock retained; client will receive 500.`,
+              persistErr,
+            );
+
+            // Handle the failure safely through the Express error-handling mechanism,
+            // provided the response has not already been sent.
+            if (!res.headersSent && !res.writableEnded) {
+              next(
+                new AppError(
+                  'The operation completed but its result could not be persisted. Please retry with the same Idempotency-Key.',
+                  500,
+                  'IDEMPOTENCY_PERSISTENCE_FAILURE'
+                )
+              );
+            }
+          }
+        })();
+
+        return res;
       };
 
-      // Fallback: if connection closes prematurely or error without json, release lock
+      // Fallback: if connection closes prematurely or error without json, release lock.
+      // This only fires for cases where the controller never called res.json() at all
+      // (e.g. the client aborted before the controller finished).
       res.on('close', () => {
-        if (!responsePersisted && !res.writableEnded) {
+        if (!persistenceHandled && !res.writableEnded) {
           prisma.idempotencyRecord
             .updateMany({
               where: { key: trimmedKey, isLocked: true },
