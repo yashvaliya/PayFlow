@@ -1,311 +1,218 @@
-# PayFlow — Payment Processing & Reconciliation Platform
+# PayFlow — Payment Processing & Double-Entry Ledger
 
 [![CI Pipeline](https://github.com/yashvaliya/payflow/actions/workflows/ci.yml/badge.svg)](https://github.com/yashvaliya/payflow/actions/workflows/ci.yml)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> A production-grade fintech web platform demonstrating real-world payment API integration, transaction integrity, double-entry financial ledger accounting, strict idempotency, event-driven webhook processing, and automated settlement reconciliation.
+A full-stack payment processing platform built with **React**, **Node/Express**, **PostgreSQL**, and the **PayPal REST API**.
 
-Built for the **PayPal Software Engineering Intern** portfolio assessment.
-
----
-
-## 1. Project Introduction
-
-PayFlow is a professional merchant settlement and payment management platform built from first principles to simulate a real payment facilitator. Rather than treating payment APIs as simple webhook callbacks or static checkouts, PayFlow handles the complete transaction lifecycle: authoritative pricing, payment order creation, secure PayPal Sandbox capture, append-only double-entry ledger settlement, full/partial refund reversals, cryptographic webhook signature verification, and order-level discrepancy reconciliation.
+Built by **Yash Valiya** to study how real-world fintech systems handle money, failure states, and accounting without rounding errors or duplicate charges.
 
 ---
 
-## 2. Problem Statement
+## Why I Built This
 
-Many web applications make fatal financial engineering mistakes:
-1. **Floating-point rounding errors:** Using JavaScript `Number` for currency calculations leads to penny discrepancies ($0.1 + $0.2 = $0.30000000000000004).
-2. **Client-side price tampering:** Accepting prices or totals sent directly from the browser allows malicious users to alter checkout amounts.
-3. **Duplicate billing & race conditions:** Rapid double-clicking or network retries creating duplicate charges without strict server idempotency.
-4. **Discrepancies & missing callbacks:** Webhooks dropped due to network partitions leaving internal order states out of sync with payment providers.
-5. **Single-entry or editable balances:** Modifying historical transaction rows rather than maintaining an immutable, balanced accounting journal.
+Most tutorial payment apps make fundamental mistakes when handling real money:
 
-**PayFlow solves every one of these problems with robust architectural safeguards.**
+1. **Floating-point money bugs:** Writing `0.1 + 0.2` in JavaScript produces `0.30000000000000004`. Over thousands of transactions, penny drift destroys accounting balances.
+2. **Trusting the browser with prices:** If the client sends `{ amount: 99.00 }`, a malicious user can inspect element and send `{ amount: 1.00 }`.
+3. **Double-click charges:** If a user clicks "Pay" twice or their network drops during checkout, they get charged twice without an idempotency key.
+4. **Out-of-order or missed webhooks:** Webhooks can arrive out of order, get dropped by network partitions, or fire multiple times.
+5. **Editing historical rows:** When someone gets a refund, typical apps just update `status = "REFUNDED"`. Real accounting requires an immutable double-entry journal so every dollar is tracked.
 
----
-
-## 3. Key Features
-
-- **Real PayPal Sandbox Integration:** Direct integration with PayPal REST API v2 (`/v2/checkout/orders` and `/v2/payments/captures/{id}/refund`) using cached OAuth 2.0 client credentials.
-- **Authoritative Server Pricing:** Product catalog retrieved from PostgreSQL; totals calculated exclusively on the server in integer cents.
-- **Double-Entry Financial Ledger:** Append-only ledger recording debit and credit journal entries (`PAYPAL_CLEARING` and `MERCHANT_PAYABLE`). System invariant `Sum(Debits) === Sum(Credits)` verified in atomic database transactions.
-- **Strict Idempotency Engine:** State-mutating endpoints require `Idempotency-Key`. Replays identical responses on repeated requests and rejects payload changes with HTTP 409 Conflict.
-- **Event-Driven Webhook Pipeline:** Cryptographic signature verification against PayPal certs, event ID deduplication, and asynchronous background settlement workers.
-- **Order-Level Reconciliation Engine:** Cross-references internal PostgreSQL records against PayPal ground truth, flags discrepancies, and exports CSV audit reports.
-- **Role-Based Access Control (RBAC):** Admin and Viewer roles. Only authorized Admins can initiate refunds or trigger reconciliation jobs.
-- **1-Click Recruiter Demo Access:** Instant sign-in buttons for Admin (`admin@payflow.internal`) and Viewer (`viewer@payflow.internal`).
+**PayFlow solves each of these problems directly.**
 
 ---
 
-## 4. Technology Stack
+## Key Features
 
-### Frontend
-- **Framework:** React 18, TypeScript, Vite
-- **Styling:** Tailwind CSS, shadcn/ui design tokens
-- **State & Data Fetching:** TanStack React Query (v5)
-- **Routing:** React Router 7
-- **Visualizations:** Recharts (Area charts, Donut charts)
-- **Icons:** Lucide React
-
-### Backend
-- **Runtime:** Node.js 22 LTS, Express.js, TypeScript (ES2022 / NodeNext)
-- **Database & ORM:** PostgreSQL 16, Prisma ORM
-- **Validation:** Zod schemas for all request payloads
-- **Security:** Helmet, CORS, Argon2/Bcrypt password hashing, JWT HTTP-only cookies, Rate Limiting
-- **Documentation:** Swagger UI / OpenAPI 3.0
-
-### Testing & DevOps
-- **Testing:** Vitest, Supertest (19 unit & integration tests, 100% passing)
-- **Containerization:** Multi-stage Dockerfile, Docker Compose
-- **CI/CD:** GitHub Actions automated test & build pipeline
+- **PayPal Sandbox Checkout:** Integrated directly with PayPal's REST API v2 (`/v2/checkout/orders` and capture/refund endpoints) using OAuth 2.0 client credentials and token caching.
+- **Server-Authoritative Pricing:** The frontend sends item IDs and quantities; the server looks up authoritative prices in PostgreSQL and calculates totals.
+- **Double-Entry Financial Ledger:** Every capture and refund posts balanced debit/credit journals (`PAYPAL_CLEARING` and `MERCHANT_PAYABLE`). The system verifies the invariant $\sum \text{Debits} \equiv \sum \text{Credits}$ atomically.
+- **Integer Minor Units (Cents):** No floating-point math anywhere. $99.00 is stored and calculated as `9900` integer cents.
+- **Idempotency Engine:** State-changing endpoints require an `Idempotency-Key` header. Duplicate requests replay the original response, and payload changes return `409 Conflict`.
+- **Deduplicated Webhook Queue:** Ingests PayPal webhooks, verifies signatures, deduplicates on `eventId`, and processes settlements asynchronously.
+- **Order-Level Reconciliation:** Cross-references internal database records against PayPal's actual records to flag missing callbacks or discrepancies, and exports an audit CSV.
+- **Role-Based Access Control:** Separate Admin (`yash@payflow.dev`) and Auditor (`alex@payflow.dev`) roles with JWT authentication. Only Admins can issue refunds or trigger reconciliation runs.
 
 ---
 
-## 5. Architecture Diagram
+## Architecture Overview
 
-```mermaid
-flowchart TD
-    Client[React 18 + Vite SPA] -->|Idempotency-Key + Bearer JWT| Gateway[Express.js REST Gateway]
-    
-    subgraph PayFlow Platform Core
-        Gateway --> AuthMiddleware[RBAC & JWT Auth]
-        Gateway --> IdempotencyEngine[Idempotency Middleware]
-        Gateway --> PaymentService[Authoritative Payment Service]
-        Gateway --> LedgerService[Double-Entry Ledger Service]
-        Gateway --> ReconciliationService[Reconciliation Engine]
-        Gateway --> WebhookService[Webhook Ingestion Engine]
-        
-        PaymentService --> StateMachine[Payment State Machine]
-        PaymentService --> PostgreSQL[(PostgreSQL Database)]
-        LedgerService --> PostgreSQL
-        IdempotencyEngine --> PostgreSQL
-        WebhookService --> PostgreSQL
-    end
-
-    subgraph PayPal Cloud
-        PaymentService -->|OAuth 2.0 / REST v2| PayPalAPI[PayPal Sandbox API]
-        PayPalAPI -->|Signature-Verified Webhook| WebhookService
-        ReconciliationService -->|Ground Truth Verification| PayPalAPI
-    end
+```
+                      ┌─────────────────────────────────────────┐
+                      │          React 18 + Vite (SPA)          │
+                      │  Tailwind CSS • TanStack Query • Recharts│
+                      └────────────────────┬────────────────────┘
+                                           │ Idempotency-Key
+                                           │ Bearer JWT
+                                           ▼
+                      ┌─────────────────────────────────────────┐
+                      │         Express.js API Gateway          │
+                      │       Zod Validation • Rate Limiter     │
+                      └────┬───────────────┬────────────────┬───┘
+                           │               │                │
+            ┌──────────────▼───┐   ┌───────▼──────┐  ┌──────▼────────┐
+            │  Payment Service │   │ Ledger Engine│  │ Reconciliation│
+            │  (State Machine) │   │ (Double-Entry│  │    Engine     │
+            └──────────────┬───┘   └───────┬──────┘  └──────┬────────┘
+                           │               │                │
+                           ▼               ▼                ▼
+                      ┌─────────────────────────────────────────┐
+                      │          PostgreSQL 16 Database         │
+                      │          (Managed with Prisma)          │
+                      └────────────────────┬────────────────────┘
+                                           │
+                                           │ REST v2 & Webhooks
+                                           ▼
+                      ┌─────────────────────────────────────────┐
+                      │           PayPal Sandbox Cloud          │
+                      └─────────────────────────────────────────┘
 ```
 
 ---
 
-## 6. Database Schema Overview
-
-Designed with Prisma ORM and PostgreSQL:
+## How a Payment Moves Through PayFlow
 
 ```
-users                     — User credentials, names, and roles (ADMIN, VIEWER)
-products                  — Authoritative catalog, SKUs, and unit amounts in cents
-orders                    — Customer orders and totals
-order_items               — Order line items linked to products
-payments                  — Payment records, statuses, PayPal Order & Capture IDs
-payment_state_transitions — Auditable state transition history
-refunds                   — Full or partial refund records with PayPal Refund IDs
-idempotency_records       — Unique keys, operation names, request hashes, response cache
-ledger_accounts           — Chart of accounts (PAYPAL_CLEARING, MERCHANT_PAYABLE)
-ledger_journals           — Double-entry journals (Capture, Refund reversals)
-ledger_entries            — Debit and Credit entries with amountMinor
-webhook_events            — Persisted PayPal events with deduplicated eventId
-reconciliation_runs       — Reconciliation batches and summaries
-reconciliation_items      — Itemized comparison matrices and discrepancy flags
-audit_logs                — Administrative audit trail
+1. Customer picks items
+      │
+      ▼
+2. Server recalculates total from Postgres (never trusts client amount)
+      │
+      ▼
+3. Server creates PayPal Order with PayPal-Request-Id (Idempotent)
+      │
+      ▼
+4. Buyer approves checkout in PayPal
+      │
+      ▼
+5. Server calls PayPal /capture endpoint
+      │
+      ▼
+6. In a single atomic database transaction:
+   ├── Transition state: PENDING_APPROVAL -> COMPLETED
+   ├── Post Ledger Journal:
+   │     Debit:  PAYPAL_CLEARING      +$99.00 (Asset increases)
+   │     Credit: MERCHANT_PAYABLE     +$99.00 (Liability increases)
+   └── Verify invariant: Debits == Credits
 ```
 
 ---
 
-## 7. Payment Lifecycle & State Transitions
+## Tech Stack
 
-1. `CREATED`: Local order and payment record initialized with server-calculated price.
-2. `PENDING_APPROVAL`: PayPal order created; awaiting buyer sandbox authorization.
-3. `APPROVED`: Buyer authorizes payment via PayPal Sandbox modal.
-4. `COMPLETED`: Payment captured by PayPal; atomically posts double-entry ledger capture journal.
-5. `REFUND_PENDING`: Admin submits full or partial refund request.
-6. `PARTIALLY_REFUNDED`: PayPal confirms partial refund; posts reversing ledger journal.
-7. `REFUNDED`: Full amount refunded; order marked refunded.
-8. `FAILED` / `CANCELLED`: Terminal failure states.
-
----
-
-## 8. Idempotency Implementation
-
-State-mutating endpoints (`/api/payments/orders`, `/api/payments/:id/capture`, `/api/payments/:id/refund`) require the `Idempotency-Key` header:
-1. **Uniqueness:** Stored in PostgreSQL with unique index on `key`.
-2. **Payload Hash Check:** Compares SHA-256 hash of incoming JSON payload against original request.
-3. **Response Replay:** If key exists with matching hash, returns stored response with `X-Idempotent-Replay: true`.
-4. **Tamper Rejection:** If key exists with different payload, returns `HTTP 409 Conflict`.
-5. **In-Flight Lock:** If another request is currently processing with that key, returns `HTTP 409 Concurrent Request in Progress`.
+| Layer | Tools |
+|---|---|
+| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, TanStack Query, Recharts, Lucide Icons |
+| **Backend** | Node.js 22 LTS, Express.js, TypeScript, Prisma ORM, Zod |
+| **Database** | PostgreSQL 16 |
+| **Payments** | PayPal REST API v2, PayPal JS SDK |
+| **Testing** | Vitest, Supertest (19 unit & integration tests) |
+| **DevOps** | Docker, Docker Compose, GitHub Actions CI |
 
 ---
 
-## 9. Double-Entry Financial Ledger
+## Project Structure
 
-PayFlow implements strict double-entry bookkeeping:
-- All values stored in **integer minor units** (e.g. cents: $99.00 = `9900`).
-- **Capture Journal:**
-  - **Debit:** `PAYPAL_CLEARING` (Asset increases)
-  - **Credit:** `MERCHANT_PAYABLE` (Liability increases)
-- **Refund Journal:**
-  - **Debit:** `MERCHANT_PAYABLE` (Liability decreases)
-  - **Credit:** `PAYPAL_CLEARING` (Asset decreases)
-- **Invariant:** `Sum(Debits) === Sum(Credits)` strictly verified across every journal.
-
----
-
-## 10. Webhook Processing
-
-- **Endpoint:** `POST /api/webhooks/paypal`
-- **Signature Verification:** Preserves raw HTTP body; verifies transmission headers with PayPal API.
-- **Deduplication:** Unique index on `eventId` prevents duplicate event processing.
-- **Asynchronous Execution:** Accepts event immediately with HTTP 200, then settles in background.
-- **Shared Service:** Invokes the same settlement and ledger service as synchronous capture.
-
----
-
-## 11. Reconciliation Logic
-
-The Reconciliation Engine compares PostgreSQL transactions against live PayPal Sandbox records:
-1. Fetches recent payments with PayPal Order or Capture IDs.
-2. Queries PayPal API for authoritative status and amount.
-3. Compares internal status vs. PayPal status and internal amount vs. provider amount.
-4. Categorizes into:
-   - `MATCHED`: Parity confirmed across state and amount.
-   - `INTERNAL_MISMATCH`: Discrepancy between internal database and provider.
-   - `PROVIDER_MISMATCH`: Amount or status mismatch.
-   - `PENDING_REVIEW`: Ambiguous state or missing capture ID.
-5. Generates downloadable CSV audit reports.
+```
+PayFlow/
+├── client/                      # React frontend
+│   ├── src/
+│   │   ├── api/client.ts        # Typed API client
+│   │   ├── components/          # Navbar, Footer, SandboxBanner, StatusBadge
+│   │   ├── context/             # AuthContext, ThemeContext
+│   │   ├── pages/               # Lazy-loaded route pages (Dashboard, Checkout, Ledger, etc.)
+│   │   └── lib/utils.ts         # Money formatting (cents -> dollars)
+│   └── vite.config.ts
+├── server/                      # Express backend
+│   ├── prisma/
+│   │   ├── schema.prisma        # 16 database models
+│   │   ├── migrations/          # Version-controlled SQL migrations
+│   │   └── seed.ts              # Demo products and accounts
+│   ├── src/
+│   │   ├── controllers/         # HTTP request handlers
+│   │   ├── services/            # Payment, Ledger, Webhook, and Reconciliation services
+│   │   ├── middleware/          # Idempotency, Auth, Error handling
+│   │   ├── integrations/paypal/ # PayPal REST client with token caching
+│   │   └── utils/               # Money arithmetic & custom error classes
+│   └── tests/                   # Vitest unit & integration test suites
+├── Dockerfile                   # Multi-stage production container build
+├── docker-compose.yml           # App + PostgreSQL container setup
+└── .github/workflows/ci.yml     # Automated GitHub Actions test & build pipeline
+```
 
 ---
 
-## 12. Local Installation Instructions
+## Quickstart
 
 ### Prerequisites
-- Node.js >= 22.0.0
-- npm >= 10.0.0
-- Docker and Docker Compose (or local PostgreSQL)
+- Node.js >= 20.0.0
+- Docker & Docker Compose (or a local PostgreSQL 16 instance)
 
-### Steps
+### 1. Clone & Install
 ```bash
-# 1. Clone repository
-git clone https://github.com/yashvaliya/payflow.git
-cd payflow
-
-# 2. Install dependencies
+git clone https://github.com/yashvaliya/PayFlow.git
+cd PayFlow
 npm install
+```
 
-# 3. Configure environment
-cp .env.example .env
-cp server/.env.example server/.env
+### 2. Configure Environment
+Copy `.env.example` to `.env`:
+```bash
+cp .env.example server/.env
+```
 
-# 4. Start local database
-docker-compose up db -d
+### 3. Start Database & Seed
+```bash
+docker compose up -d db
+npm run prisma:migrate
+npm run prisma:seed
+```
 
-# 5. Push schema and seed demo data
-npm run prisma:migrate --workspace=server
-npm run prisma:seed --workspace=server
-
-# 6. Start development server
+### 4. Run the Dev Servers
+```bash
 npm run dev
 ```
-
-Visit `http://localhost:5173` for the Vite development client.
-
----
-
-## 13. Environment Configuration
-
-```env
-PORT=5001
-NODE_ENV=development
-APP_BASE_URL=http://localhost:5173
-DATABASE_URL="postgresql://payflow_user:payflow_secure_password@localhost:5432/payflow?schema=public"
-JWT_SECRET="secure_random_key_min_32_characters_long"
-SESSION_SECRET="secure_random_key_min_32_characters_long"
-
-PAYPAL_MODE=sandbox
-PAYPAL_CLIENT_ID=your_paypal_sandbox_client_id
-PAYPAL_CLIENT_SECRET=your_paypal_sandbox_client_secret
-PAYPAL_WEBHOOK_ID=your_paypal_webhook_id
-```
+- Frontend: `http://localhost:5173`
+- Backend API: `http://localhost:5001`
+- Swagger Docs: `http://localhost:5001/api/docs`
 
 ---
 
-## 14. PayPal Sandbox Setup
+## Automated Test Suite
 
-1. Create a developer account at [developer.paypal.com](https://developer.paypal.com).
-2. Create a Sandbox REST App in the dashboard.
-3. Copy **Client ID** and **Secret** to `.env`.
-4. In sandbox accounts, create a **Personal / Buyer** account for checkout testing.
-5. In your PayPal App settings, register webhook URL: `https://<domain>/api/webhooks/paypal`.
-
----
-
-## 15. Testing Instructions
-
-Run the automated Vitest test suite:
+Run the full test suite with:
 ```bash
-npm run test --workspace=server
+npm test
 ```
 
-All 19 tests in 4 test suites will execute, verifying:
-- Minor units money arithmetic & float safety
-- State machine transition rules & terminal states
-- Double-entry ledger balancing invariants
-- Idempotency replay and conflict detection
-- Role-based authorization guards on refunds
-- Webhook signature verification and deduplication
+PayFlow includes 19 automated tests covering:
+- **Money arithmetic (`tests/unit/money.test.ts`):** Verifies no floating-point rounding errors and proper cent conversions.
+- **State machine (`tests/unit/stateMachine.test.ts`):** Ensures invalid transitions (e.g. `FAILED` -> `COMPLETED`) are blocked.
+- **Ledger invariant (`tests/unit/ledger.test.ts`):** Tests that every capture and refund journal balances ($\sum \text{Debits} = \sum \text{Credits}$).
+- **Integration flows (`tests/integration/payments.test.ts`):**
+  - Rejection of financial requests without `Idempotency-Key`
+  - Cached response replay on repeated requests
+  - Rejection of modified payloads under the same key (`409 Conflict`)
+  - Capture & atomic ledger settlement
+  - Role-based refund access (`VIEWER` blocked, `ADMIN` allowed)
+  - Webhook deduplication on `eventId`
 
 ---
 
-## 16. Docker Instructions
+## Demo Credentials
 
-Run the entire application in Docker:
-```bash
-docker-compose up --build -d
-```
-Access the application at `http://localhost:5001`.
+| Role | Email | Password | Permissions |
+|---|---|---|---|
+| **Admin** | `yash@payflow.dev` (or `admin@payflow.internal`) | `AdminPassword123!` | Full access: capture, refund, trigger reconciliation |
+| **Auditor** | `alex@payflow.dev` (or `viewer@payflow.internal`) | `ViewerPassword123!` | Read-only: view dashboards, transactions, ledger, and webhooks |
 
----
-
-## 17. Deployment Instructions
-
-PayFlow is containerized with a production multi-stage Dockerfile:
-1. Connect repository to [Railway](https://railway.app) or [Render](https://render.com).
-2. Provision a managed PostgreSQL instance.
-3. Set environment variables: `DATABASE_URL`, `JWT_SECRET`, `PAYPAL_MODE=sandbox`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`.
-4. Set build command to `npm run build` and start command to `node server/dist/server.js`.
+*(The web interface also includes 1-click login buttons on the login page and landing page).*
 
 ---
 
-## 18. API Documentation Link
+## License
 
-- **Interactive OpenAPI / Swagger UI:** `http://localhost:5001/api/docs`
-- **Markdown Specification:** See [API_DOCUMENTATION.md](API_DOCUMENTATION.md)
-
----
-
-## 19. Demo Flow & User Walkthrough
-
-1. Open the application.
-2. Click **1-Click Admin Login** on the home page or navbar.
-3. Open **Checkout** (`/checkout`), choose a service, and click **Proceed to PayPal Sandbox Checkout**.
-4. Confirm sandbox capture.
-5. Inspect the generated **Transaction Details** (`/transactions/:id`).
-6. Inspect the double-entry journal entries posted under **Ledger** (`/ledger`).
-7. Click **Verify Accounting Invariant** to confirm `Sum(Debits) === Sum(Credits)`.
-8. Execute a partial or full refund and observe the reversing ledger entry.
-9. Open **Reconciliation** (`/reconciliation`), trigger a job, and export the CSV report.
-
----
-
-## 20. Known Limitations
-
-- **Currency Scope:** Currently configured for USD minor units (cents) to maintain strict financial invariants. Architecture is structured to support multi-currency ISO codes in future iterations.
-- **Sandbox Boundary:** Designed exclusively for PayPal Sandbox API testing; real-money transactions are intentionally disabled.
+MIT © Yash Valiya

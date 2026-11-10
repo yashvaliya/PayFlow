@@ -7,11 +7,11 @@ export const SandboxBanner: React.FC = () => {
       <div className="flex items-center gap-2 max-w-7xl mx-auto w-full">
         <ShieldAlert className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
         <div className="flex-1 truncate">
-          <span className="font-semibold">PayPal Sandbox Environment:</span> Real-money transactions are disabled. All checkout and payment operations operate strictly within the PayPal Developer Sandbox testing network.
+          <span className="font-semibold">PayPal Sandbox Test Mode:</span> No real money is moved. All payments run through PayPal Developer sandbox test accounts.
         </div>
         <div className="hidden md:flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-800 dark:text-amber-300 text-xs shrink-0 font-mono">
           <Info className="w-3.5 h-3.5" />
-          <span>PORTFOLIO DEMO</span>
+          <span>DEMO SANDBOX</span>
         </div>
       </div>
     </div>

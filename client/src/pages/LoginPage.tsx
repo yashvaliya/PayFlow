@@ -65,18 +65,18 @@ export const LoginPage: React.FC = () => {
             <CreditCard className="w-6 h-6" />
           </div>
           <h1 className="text-2xl font-extrabold text-foreground tracking-tight">
-            {isRegisterMode ? 'Create PayFlow Account' : 'Sign in to PayFlow'}
+            {isRegisterMode ? 'Create an Account' : 'Sign in to PayFlow'}
           </h1>
           <p className="text-xs text-muted-foreground mt-1">
-            Access merchant dashboards, ledger journals, and settlement tools.
+            Access the merchant dashboard, accounting ledger, and settlement tools.
           </p>
         </div>
 
-        {/* 1-Click Recruiter Demo Access */}
+        {/* 1-Click Demo Access */}
         <div className="p-4 rounded-2xl bg-card border border-border shadow-sm space-y-3">
           <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-muted-foreground">
             <Sparkles className="w-3.5 h-3.5 text-primary" />
-            <span>Instant Demo Access</span>
+            <span>Test Accounts (1-Click Login)</span>
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -87,9 +87,9 @@ export const LoginPage: React.FC = () => {
               className="p-3 rounded-xl bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 text-left transition-colors"
             >
               <div className="text-xs font-bold text-blue-700 dark:text-blue-300">
-                Demo Admin
+                Yash (Admin)
               </div>
-              <div className="text-[10px] text-muted-foreground mt-0.5">Full refund &amp; recon rights</div>
+              <div className="text-[10px] text-muted-foreground mt-0.5">Can trigger refunds &amp; recon</div>
             </button>
 
             <button
@@ -99,9 +99,9 @@ export const LoginPage: React.FC = () => {
               className="p-3 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-left transition-colors"
             >
               <div className="text-xs font-bold text-emerald-700 dark:text-emerald-300">
-                Demo Viewer
+                Alex (Auditor)
               </div>
-              <div className="text-[10px] text-muted-foreground mt-0.5">Read-only auditing view</div>
+              <div className="text-[10px] text-muted-foreground mt-0.5">Read-only view</div>
             </button>
           </div>
         </div>
@@ -127,7 +127,7 @@ export const LoginPage: React.FC = () => {
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-background border border-input text-foreground outline-none focus:ring-1 focus:ring-primary"
-                    placeholder="Sarah Chen"
+                    placeholder="Yash Valiya"
                   />
                 </div>
               </div>

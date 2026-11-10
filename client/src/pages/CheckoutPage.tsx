@@ -31,8 +31,8 @@ export const CheckoutPage: React.FC = () => {
 
   // Cart state: map of productId -> quantity
   const [cart, setCart] = useState<Record<string, number>>({});
-  const [customerEmail, setCustomerEmail] = useState('demo.buyer@paypal-sandbox.test');
-  const [customerName, setCustomerName] = useState('Alex Rivera (Demo Buyer)');
+  const [customerEmail, setCustomerEmail] = useState('alex.rivera@example.com');
+  const [customerName, setCustomerName] = useState('Alex Rivera');
 
   // Processing state
   const [isCreatingOrder, setIsCreatingOrder] = useState(false);
@@ -145,17 +145,17 @@ export const CheckoutPage: React.FC = () => {
       <div>
         <div className="flex items-center gap-2">
           <span className="text-xs font-bold uppercase tracking-wider text-primary">
-            Interactive Payment Integration
+            PayPal Sandbox Store
           </span>
           <span className="text-[10px] font-mono bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold px-2 py-0.5 rounded-full">
-            SDK &amp; REST v2
+            REST v2 Integration
           </span>
         </div>
         <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-foreground mt-1">
-          PayPal Sandbox Demo Checkout
+          Checkout &amp; Settle
         </h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Select digital services, verify authoritative server-side price calculation, and execute real sandbox capture.
+          Pick an item to test the checkout flow, create a PayPal order, and see the state machine advance to captured and settled.
         </p>
       </div>
 

@@ -85,10 +85,10 @@ export const DashboardPage: React.FC = () => {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-foreground">
-            Merchant Overview &amp; Settlements
+            Merchant Dashboard
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Authoritative, database-backed settlement metrics and financial activity.
+            Real-time settlement balances, payment volume, and activity from PostgreSQL.
           </p>
         </div>
 
