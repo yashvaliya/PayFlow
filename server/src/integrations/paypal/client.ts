@@ -62,10 +62,25 @@ export class PayPalClient {
   private tokenCache: AccessTokenCache | null = null;
 
   constructor() {
-    this.baseUrl =
-      env.PAYPAL_MODE === 'live'
-        ? 'https://api-m.paypal.com'
-        : 'https://api-m.sandbox.paypal.com';
+    this.baseUrl = env.PAYPAL_BASE_URL || 'https://api-m.sandbox.paypal.com';
+    this.assertSandboxSafety();
+  }
+
+  /**
+   * Sandbox Safety Guardrail:
+   * Portfolio demonstration platform must NEVER process real-money transactions.
+   */
+  public assertSandboxSafety(): void {
+    if (
+      this.baseUrl.includes('api.paypal.com') ||
+      (this.baseUrl.includes('api-m.paypal.com') && !this.baseUrl.includes('sandbox'))
+    ) {
+      throw new AppError(
+        'Fatal Safety Violation: Live PayPal endpoint detected. PayFlow is strictly a demonstration platform locked to sandbox.',
+        500,
+        'LIVE_PAYMENTS_FORBIDDEN'
+      );
+    }
   }
 
   public isConfigured(): boolean {
@@ -90,6 +105,7 @@ export class PayPalClient {
   }
 
   private ensureConfiguredOrMock(operation: string): void {
+    this.assertSandboxSafety();
     if (!this.isConfigured() && !this.isMockAllowed()) {
       throw new AppError(
         `PayPal credentials are not configured. Cannot execute ${operation} without valid API keys.`,

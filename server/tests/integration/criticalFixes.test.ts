@@ -54,6 +54,7 @@ describe('Critical Payment & Security Fixes', () => {
 
       // Spy on captureOrder to return an amount mismatch
       const originalCapture = payPalClient.captureOrder.bind(payPalClient);
+      const mockCapId = `MOCK-CAP-MISMATCH-${Date.now()}`;
       const captureSpy = vi.spyOn(payPalClient, 'captureOrder').mockImplementation(async (params) => {
         const res = await originalCapture(params);
         return {
@@ -63,7 +64,7 @@ describe('Critical Payment & Security Fixes', () => {
               payments: {
                 captures: [
                   {
-                    id: 'MOCK-CAP-MISMATCH-1',
+                    id: mockCapId,
                     status: 'COMPLETED',
                     amount: {
                       currency_code: 'USD',
@@ -87,11 +88,12 @@ describe('Critical Payment & Security Fixes', () => {
       expect(captureRes.status).toBe(400);
       expect(captureRes.body.error.message).toMatch(/mismatch/i);
 
-      // Verify payment in database is marked FAILED and has no ledger journals
+      // Verify payment in database is placed under REQUIRES_REVIEW and has no ledger journals
       const paymentInDb = await prisma.payment.findUnique({
         where: { id: paymentId },
       });
-      expect(paymentInDb?.status).toBe(PaymentStatus.FAILED);
+      expect(paymentInDb?.status).toBe(PaymentStatus.REQUIRES_REVIEW);
+      expect(paymentInDb?.providerCaptureId).toBe(mockCapId);
       expect(paymentInDb?.failureReason).toMatch(/mismatch/i);
 
       const journals = await prisma.ledgerJournal.findMany({
@@ -114,6 +116,7 @@ describe('Critical Payment & Security Fixes', () => {
       const paymentId = orderRes.body.data.paymentId;
 
       const originalCapture = payPalClient.captureOrder.bind(payPalClient);
+      const mockEurCapId = `MOCK-CAP-MISMATCH-EUR-${Date.now()}`;
       const captureSpy = vi.spyOn(payPalClient, 'captureOrder').mockImplementation(async (params) => {
         const res = await originalCapture(params);
         return {
@@ -123,7 +126,7 @@ describe('Critical Payment & Security Fixes', () => {
               payments: {
                 captures: [
                   {
-                    id: 'MOCK-CAP-MISMATCH-EUR',
+                    id: mockEurCapId,
                     status: 'COMPLETED',
                     amount: {
                       currency_code: 'EUR', // mismatched currency
@@ -150,7 +153,8 @@ describe('Critical Payment & Security Fixes', () => {
       const paymentInDb = await prisma.payment.findUnique({
         where: { id: paymentId },
       });
-      expect(paymentInDb?.status).toBe(PaymentStatus.FAILED);
+      expect(paymentInDb?.status).toBe(PaymentStatus.REQUIRES_REVIEW);
+      expect(paymentInDb?.providerCaptureId).toBe(mockEurCapId);
 
       const journals = await prisma.ledgerJournal.findMany({
         where: { referenceId: paymentId },
@@ -305,7 +309,7 @@ describe('Critical Payment & Security Fixes', () => {
 
       // Mock refundCapture to return status FAILED from PayPal
       const refundSpy = vi.spyOn(payPalClient, 'refundCapture').mockResolvedValueOnce({
-        id: 'MOCK-REF-REJECTED',
+        id: `MOCK-REF-REJECTED-${Date.now()}`,
         status: 'FAILED',
         amount: { value: '10.00', currency_code: 'USD' },
         create_time: new Date().toISOString(),

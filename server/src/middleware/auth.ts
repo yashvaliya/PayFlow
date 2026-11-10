@@ -5,6 +5,7 @@ import { UnauthorizedError, ForbiddenError } from '../utils/errors.js';
 import { Role, AuthUser } from '../types/index.js';
 
 declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: AuthUser;

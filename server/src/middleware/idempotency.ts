@@ -38,12 +38,17 @@ export function computeRequestHash(payload: any): string {
  * 
  * Enforces:
  * - Presence of Idempotency-Key header
+ * - User/session isolation (prevents cross-user response replay)
  * - Operation identity validation (same key cannot be reused across different operations)
  * - Recursive request payload hash validation (returns 409 Conflict if payload differs)
- * - In-flight concurrency lock (returns 409 Conflict if request is in progress)
+ * - In-flight concurrency lock with stale lock recovery
+ * - Recovery of unlocked records without saved responses
+ * - Reliable response persistence before transmitting HTTP response over the wire
  * - Response caching and transparent replay with X-Idempotent-Replay header
  */
 export function idempotency(operationName: string) {
+  const LOCK_EXPIRY_MS = 30_000; // 30 seconds maximum processing lock before recovery
+
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const idempotencyKey = req.header('Idempotency-Key');
 
@@ -54,6 +59,7 @@ export function idempotency(operationName: string) {
     const trimmedKey = idempotencyKey.trim();
     const requestPayload = req.body || {};
     const requestHash = computeRequestHash(requestPayload);
+    const currentUserId = (req as any).user?.id || (req as any).session?.userId || null;
 
     try {
       // 1. Check existing record
@@ -62,6 +68,13 @@ export function idempotency(operationName: string) {
       });
 
       if (existing) {
+        // Prevent cross-user / cross-session response replay
+        if (existing.userId && currentUserId && existing.userId !== currentUserId) {
+          throw new ConflictError(
+            `Idempotency-Key "${trimmedKey}" was registered by another user and cannot be reused or accessed.`
+          );
+        }
+
         // Validate operation identity: same key cannot be used for a different operation
         if (existing.operation !== operationName) {
           throw new ConflictError(
@@ -69,68 +82,97 @@ export function idempotency(operationName: string) {
           );
         }
 
-        // Validate payload hash match
-        if (existing.requestHash !== requestHash) {
-          throw new ConflictError(
-            `Idempotency-Key "${trimmedKey}" was previously used with a different request payload.`
-          );
-        }
+        // Check for stale lock (crashed or timed-out request)
+        const lockAge = Date.now() - existing.lockedAt.getTime();
+        const isStaleLock = existing.isLocked && lockAge > LOCK_EXPIRY_MS;
 
-        // If request is currently in-flight
-        if (existing.isLocked) {
-          throw new ConflictError(
-            `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
-          );
-        }
+        // Check for unlocked record without a saved response (crashed before saving response)
+        const isUnlockedWithoutResponse =
+          !existing.isLocked && (existing.responseStatus === null || existing.responseBody === null);
 
-        // Replay previous response if available
-        if (existing.responseStatus && existing.responseBody !== null) {
-          res.setHeader('X-Idempotent-Replay', 'true');
-          res.status(existing.responseStatus).json(existing.responseBody);
-          return;
+        if (isStaleLock || isUnlockedWithoutResponse) {
+          // Re-claim and recover the record for execution
+          await prisma.idempotencyRecord.update({
+            where: { key: trimmedKey },
+            data: {
+              isLocked: true,
+              lockedAt: new Date(),
+              operation: operationName,
+              requestHash,
+              requestPayload,
+              userId: currentUserId || existing.userId,
+            },
+          });
+        } else {
+          // Validate payload hash match for active or completed requests
+          if (existing.requestHash !== requestHash) {
+            throw new ConflictError(
+              `Idempotency-Key "${trimmedKey}" was previously used with a different request payload.`
+            );
+          }
+
+          if (existing.isLocked) {
+            throw new ConflictError(
+              `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
+            );
+          }
+
+          if (existing.responseStatus && existing.responseBody !== null) {
+            // Replay cached authoritative response
+            res.setHeader('X-Idempotent-Replay', 'true');
+            res.status(existing.responseStatus).json(existing.responseBody);
+            return;
+          }
+        }
+      } else {
+        // 2. Create new locked record atomically
+        try {
+          await prisma.idempotencyRecord.create({
+            data: {
+              key: trimmedKey,
+              operation: operationName,
+              userId: currentUserId,
+              requestHash,
+              requestPayload,
+              isLocked: true,
+            },
+          });
+        } catch (createErr: any) {
+          // Handle concurrent insert race (P2002: unique constraint violation)
+          if (createErr.code === 'P2002') {
+            throw new ConflictError(
+              `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
+            );
+          }
+          throw createErr;
         }
       }
 
-      // 2. Create or acquire a locked record atomically
-      try {
-        await prisma.idempotencyRecord.create({
-          data: {
-            key: trimmedKey,
-            operation: operationName,
-            requestHash,
-            requestPayload,
-            isLocked: true,
-          },
-        });
-      } catch (createErr: any) {
-        // Handle concurrent insert race (P2002: unique constraint violation)
-        if (createErr.code === 'P2002') {
-          throw new ConflictError(
-            `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
-          );
-        }
-        throw createErr;
-      }
-
-      // 3. Intercept response to persist the result and release the lock
+      // 3. Intercept response to ensure RELIABLE persistence in PostgreSQL BEFORE sending HTTP response
       let responsePersisted = false;
       const originalJson = res.json.bind(res);
 
       res.json = (body: any): Response => {
         if (!responsePersisted) {
           responsePersisted = true;
-          prisma.idempotencyRecord
-            .update({
-              where: { key: trimmedKey },
-              data: {
-                isLocked: false,
-                responseStatus: res.statusCode,
-                responseBody: body,
-              },
-            })
-            .catch((err) => {
-              console.error(`Failed to persist idempotency response for key ${trimmedKey}:`, err);
-            });
+          // Reliably persist the response and release the lock BEFORE returning HTTP response to the client
+          (async () => {
+            try {
+              await prisma.idempotencyRecord.update({
+                where: { key: trimmedKey },
+                data: {
+                  isLocked: false,
+                  responseStatus: res.statusCode,
+                  responseBody: body,
+                },
+              });
+            } catch (err) {
+              console.error(`Failed to reliably persist idempotency response for key ${trimmedKey}:`, err);
+            } finally {
+              originalJson(body);
+            }
+          })();
+          return res;
         }
         return originalJson(body);
       };

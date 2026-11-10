@@ -7,17 +7,20 @@ const ALLOWED_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
     PaymentStatus.PENDING_APPROVAL,
     PaymentStatus.CANCELLED,
     PaymentStatus.FAILED,
+    PaymentStatus.REQUIRES_REVIEW,
   ],
   [PaymentStatus.PENDING_APPROVAL]: [
     PaymentStatus.APPROVED,
     PaymentStatus.COMPLETED, // Direct capture can jump from pending approval
     PaymentStatus.CANCELLED,
     PaymentStatus.FAILED,
+    PaymentStatus.REQUIRES_REVIEW,
   ],
   [PaymentStatus.APPROVED]: [
     PaymentStatus.COMPLETED,
     PaymentStatus.FAILED,
     PaymentStatus.CANCELLED,
+    PaymentStatus.REQUIRES_REVIEW,
   ],
   [PaymentStatus.COMPLETED]: [
     PaymentStatus.REFUND_PENDING,
@@ -37,6 +40,11 @@ const ALLOWED_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
   [PaymentStatus.REFUNDED]: [],
   [PaymentStatus.CANCELLED]: [],
   [PaymentStatus.FAILED]: [],
+  [PaymentStatus.REQUIRES_REVIEW]: [
+    PaymentStatus.COMPLETED,
+    PaymentStatus.FAILED,
+    PaymentStatus.CANCELLED,
+  ],
 };
 
 export class PaymentStateMachine {

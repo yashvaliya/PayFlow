@@ -1,7 +1,7 @@
 import { app } from './app.js';
 import { env } from './config/env.js';
 import { prisma } from './config/prisma.js';
-import { WebhookService } from './services/webhookService.js';
+import { WebhookWorker } from './workers/webhookWorker.js';
 
 const PORT = parseInt(env.PORT, 10) || 5001;
 
@@ -11,10 +11,8 @@ async function start() {
     await prisma.$connect();
     console.log('PostgreSQL database connected successfully.');
 
-    // Recover any pending unhandled webhooks from PostgreSQL
-    await WebhookService.recoverPendingEvents().catch((err) => {
-      console.error('Error recovering pending webhooks on startup:', err);
-    });
+    // Start persistent PostgreSQL-backed Webhook Worker
+    WebhookWorker.start();
 
     const server = app.listen(PORT, () => {
       console.log(`===============================================`);
@@ -27,6 +25,7 @@ async function start() {
 
     const shutdown = async () => {
       console.log('Initiating graceful shutdown...');
+      WebhookWorker.stop();
       server.close(async () => {
         await prisma.$disconnect();
         console.log('PayFlow server closed gracefully.');

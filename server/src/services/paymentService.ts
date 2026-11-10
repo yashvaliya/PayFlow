@@ -271,22 +271,27 @@ export class PaymentService {
     const capturedCurrency = captureItem.amount.currency_code;
 
     if (capturedAmountMinor !== payment.amountMinor || capturedCurrency !== payment.currency) {
+      // Financial Integrity Rule: Never mark a provider-confirmed capture as FAILED.
+      // Funds were captured by PayPal, so place in REQUIRES_REVIEW and preserve transaction details for reconciliation.
       await prisma.$transaction(async (tx) => {
         await tx.payment.update({
           where: { id: payment.id },
           data: {
-            failureReason: `Amount/currency mismatch: expected ${payment.amountMinor} ${payment.currency}, captured ${capturedAmountMinor} ${capturedCurrency}`,
+            providerCaptureId,
+            providerStatus,
             rawProviderData: captureResult as any,
+            failureReason: `Capture amount or currency mismatch: expected ${payment.amountMinor} ${payment.currency}, received ${capturedAmountMinor} ${capturedCurrency}. Held for reconciliation review.`,
           },
         });
-        await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.FAILED, {
-          reason: `Amount/currency mismatch: expected ${payment.amountMinor} ${payment.currency}, captured ${capturedAmountMinor} ${capturedCurrency}`,
+        await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.REQUIRES_REVIEW, {
+          reason: `Capture mismatch: expected ${payment.amountMinor} ${payment.currency}, received ${capturedAmountMinor} ${capturedCurrency}`,
           triggeredBy: 'SYSTEM_VALIDATION',
+          metadata: { providerCaptureId, providerStatus, capturedAmountMinor, capturedCurrency },
         });
       });
 
       throw new BadRequestError(
-        `Capture amount or currency mismatch: expected ${payment.amountMinor} ${payment.currency}, received ${capturedAmountMinor} ${capturedCurrency}`
+        `Capture amount or currency mismatch: expected ${payment.amountMinor} ${payment.currency}, received ${capturedAmountMinor} ${capturedCurrency}. Payment preserved under REQUIRES_REVIEW for reconciliation.`
       );
     }
 
@@ -339,8 +344,8 @@ export class PaymentService {
 
   /**
    * 3. Process Full or Partial Refund
-   * Enforces row-level lock against concurrent partial refunds, verifies actual PayPal
-   * refund response, prevents excess refunds, and posts ledger entries only after confirmed refund.
+   * Enforces durable refund reservations before calling PayPal, verifies actual PayPal
+   * refund response, prevents excess refunds across concurrent requests, and posts ledger entries only after confirmed refund.
    */
   public static async refundPayment(params: {
     paymentId: string;
@@ -352,8 +357,8 @@ export class PaymentService {
     const refundIdempotency =
       params.idempotencyKey || `IDEM-REF-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-    // 1. Database row-level lock and validation of remaining refundable balance
-    const payment = await prisma.$transaction(async (tx) => {
+    // 1. Atomically validate balance and DURABLY RESERVE the refund before invoking PayPal
+    const reservation = await prisma.$transaction(async (tx) => {
       const [lockedPayment] = await tx.$queryRaw<Array<{
         id: string;
         orderId: string;
@@ -375,7 +380,8 @@ export class PaymentService {
 
       if (
         lockedPayment.status !== PaymentStatus.COMPLETED &&
-        lockedPayment.status !== PaymentStatus.PARTIALLY_REFUNDED
+        lockedPayment.status !== PaymentStatus.PARTIALLY_REFUNDED &&
+        lockedPayment.status !== PaymentStatus.REFUND_PENDING
       ) {
         throw new BadRequestError(
           `Only COMPLETED or PARTIALLY_REFUNDED payments can be refunded. Current status: "${lockedPayment.status}"`
@@ -395,12 +401,27 @@ export class PaymentService {
       });
 
       if (existingRefund) {
-        return { lockedPayment, existingRefund };
+        if (existingRefund.status === RefundStatus.COMPLETED) {
+          return { type: 'REPLAY_COMPLETED' as const, lockedPayment, refund: existingRefund };
+        }
+        if (existingRefund.status === RefundStatus.PENDING) {
+          return { type: 'REPLAY_PENDING' as const, lockedPayment, refund: existingRefund };
+        }
       }
 
-      const availableRefundable = lockedPayment.amountMinor - lockedPayment.refundedAmountMinor;
+      // Calculate total reserved (PENDING) and already refunded (COMPLETED)
+      const activeRefunds = await tx.refund.findMany({
+        where: {
+          paymentId: lockedPayment.id,
+          status: { in: [RefundStatus.COMPLETED, RefundStatus.PENDING] },
+        },
+      });
+
+      const totalCommittedOrReserved = activeRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
+      const availableRefundable = lockedPayment.amountMinor - totalCommittedOrReserved;
+
       if (availableRefundable <= 0) {
-        throw new BadRequestError('This transaction is already fully refunded');
+        throw new BadRequestError('This transaction is already fully refunded or has pending refund reservations');
       }
 
       const requestedRefund = params.amountMinor ?? availableRefundable;
@@ -411,52 +432,119 @@ export class PaymentService {
 
       if (requestedRefund > availableRefundable) {
         throw new BadRequestError(
-          `Requested refund amount (${requestedRefund}) exceeds remaining refundable balance (${availableRefundable})`
+          `Requested refund amount (${requestedRefund}) exceeds remaining unreserved refundable balance (${availableRefundable})`
         );
       }
 
-      return { lockedPayment, requestedRefund };
+      // DURABLE RESERVATION: Create refund record with PENDING status inside the transaction
+      // This guarantees that any concurrent request will see this reservation and be prevented from over-refunding!
+      const reservedRefund = await tx.refund.create({
+        data: {
+          paymentId: lockedPayment.id,
+          idempotencyKey: refundIdempotency,
+          amountMinor: requestedRefund,
+          currency: lockedPayment.currency,
+          reason: params.reason || null,
+          status: RefundStatus.PENDING,
+        },
+      });
+
+      return {
+        type: 'NEW_RESERVATION' as const,
+        lockedPayment,
+        reservedRefund,
+        requestedRefund,
+      };
     });
 
-    // If already executed with this idempotency key, return existing
-    if ('existingRefund' in payment && payment.existingRefund) {
+    if (reservation.type === 'REPLAY_COMPLETED') {
       return {
-        refund: payment.existingRefund,
-        payment: await this.getPaymentById(payment.lockedPayment.id),
+        refund: reservation.refund,
+        payment: await this.getPaymentById(reservation.lockedPayment.id),
       };
     }
 
-    const { lockedPayment, requestedRefund } = payment as {
-      lockedPayment: {
-        id: string;
-        orderId: string;
-        amountMinor: number;
-        refundedAmountMinor: number;
-        currency: string;
-        status: PaymentStatus;
-        providerCaptureId: string;
+    if (reservation.type === 'REPLAY_PENDING') {
+      return {
+        refund: reservation.refund,
+        payment: await this.getPaymentById(reservation.lockedPayment.id),
+        message: 'A refund for this request is currently in pending reservation status',
       };
-      requestedRefund: number;
-    };
+    }
 
-    // 2. Call PayPal refund API
-    const refundRes = await payPalClient.refundCapture({
-      providerCaptureId: lockedPayment.providerCaptureId,
-      amountMinor: requestedRefund,
-      currency: lockedPayment.currency,
-      reason: params.reason,
-      idempotencyKey: refundIdempotency,
-    });
+    const { lockedPayment, reservedRefund, requestedRefund } = reservation;
 
-    // 3. Verify actual PayPal refund response
+    // 2. Call PayPal refund API with durable reservation established
+    let refundRes;
+    try {
+      refundRes = await payPalClient.refundCapture({
+        providerCaptureId: lockedPayment.providerCaptureId!,
+        amountMinor: requestedRefund,
+        currency: lockedPayment.currency,
+        reason: params.reason,
+        idempotencyKey: refundIdempotency,
+      });
+    } catch (paypalError: any) {
+      // Ambiguous / Network error: Maintain reservation in PENDING so concurrent requests cannot over-refund!
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          rawProviderData: {
+            ambiguousError: paypalError.message,
+            errorCode: paypalError.errorCode || 'PROVIDER_TIMEOUT_OR_ERROR',
+            timestamp: new Date().toISOString(),
+          },
+        },
+      });
+
+      throw paypalError;
+    }
+
+    // 3. Inspect and handle PayPal provider response
     if (!refundRes || !refundRes.id) {
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          status: RefundStatus.FAILED,
+          rawProviderData: refundRes as any,
+        },
+      });
       throw new BadRequestError('PayPal did not return a valid refund reference ID');
     }
 
-    if (refundRes.status !== 'COMPLETED') {
-      throw new BadRequestError(
-        `PayPal refund was not completed: provider returned status "${refundRes.status || 'UNKNOWN'}"`
-      );
+    // Provider explicitly refused / failed the refund: release reservation by marking FAILED
+    if (refundRes.status === 'FAILED') {
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          status: RefundStatus.FAILED,
+          rawProviderData: refundRes as any,
+        },
+      });
+      throw new BadRequestError(`PayPal refund was not completed: provider returned status "FAILED"`);
+    }
+
+    // Provider returned PENDING: keep reservation active in PENDING status, awaiting webhook confirmation
+    if (refundRes.status === 'PENDING') {
+      await prisma.$transaction(async (tx) => {
+        await tx.refund.update({
+          where: { id: reservedRefund.id },
+          data: {
+            providerRefundId: refundRes.id,
+            status: RefundStatus.PENDING,
+            rawProviderData: refundRes as any,
+          },
+        });
+        await PaymentStateMachine.transition(tx, lockedPayment.id, PaymentStatus.REFUND_PENDING, {
+          reason: `Refund pending provider confirmation (Refund ID: ${refundRes.id})`,
+          triggeredBy: params.triggeredBy || 'PAYPAL_API',
+        });
+      });
+
+      return {
+        refund: await prisma.refund.findUniqueOrThrow({ where: { id: reservedRefund.id } }),
+        payment: await this.getPaymentById(lockedPayment.id),
+      };
     }
 
     // Validate confirmed refund amount and currency
@@ -464,50 +552,45 @@ export class PaymentService {
     const confirmedCurrency = refundRes.amount?.currency_code || lockedPayment.currency;
 
     if (confirmedRefundMinor !== requestedRefund || confirmedCurrency !== lockedPayment.currency) {
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          status: RefundStatus.PENDING,
+          rawProviderData: {
+            error: 'Refund amount or currency mismatch with provider confirmation',
+            refundRes: refundRes as any,
+          },
+        },
+      });
       throw new BadRequestError(
         `PayPal refund amount or currency mismatch: requested ${requestedRefund} ${lockedPayment.currency}, confirmed ${confirmedRefundMinor} ${confirmedCurrency}`
       );
     }
 
-    // 4. Atomically record confirmed refund, update balances, and post ledger reversal
-    const result = await prisma.$transaction(async (tx) => {
-      // Re-lock payment to update refunded balance safely
-      const [currentPayment] = await tx.$queryRaw<Array<{
-        id: string;
-        amountMinor: number;
-        refundedAmountMinor: number;
-      }>>`
-        SELECT id, "amountMinor", "refundedAmountMinor"
-        FROM payments
-        WHERE id = ${lockedPayment.id}
-        FOR UPDATE
-      `;
+    // 4. Atomically confirm refund, increment payment refunded amount, and post ledger reversal
+    const finalRefund = await prisma.$transaction(async (tx) => {
+      // Re-query current payment status
+      const currentPayment = await tx.payment.findUniqueOrThrow({
+        where: { id: lockedPayment.id },
+      });
 
-      const available = currentPayment.amountMinor - currentPayment.refundedAmountMinor;
-      if (confirmedRefundMinor > available) {
-        throw new BadRequestError(
-          `Refund of ${confirmedRefundMinor} exceeds remaining available balance of ${available}`
-        );
-      }
-
-      const isFullRefund = currentPayment.refundedAmountMinor + confirmedRefundMinor >= currentPayment.amountMinor;
+      const newRefundedTotal = currentPayment.refundedAmountMinor + confirmedRefundMinor;
+      const isFullRefund = newRefundedTotal >= currentPayment.amountMinor;
       const targetStatus = isFullRefund ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
 
-      // 1. Record refund in database with COMPLETED status
-      const refundRecord = await tx.refund.create({
+      // Update refund record to COMPLETED
+      const updatedRefund = await tx.refund.update({
+        where: { id: reservedRefund.id },
         data: {
-          paymentId: lockedPayment.id,
-          idempotencyKey: refundIdempotency,
           providerRefundId: refundRes.id,
           amountMinor: confirmedRefundMinor,
           currency: confirmedCurrency,
-          reason: params.reason,
           status: RefundStatus.COMPLETED,
           rawProviderData: refundRes as any,
         },
       });
 
-      // 2. Increment payment refunded amount
+      // Update payment refunded amount
       await tx.payment.update({
         where: { id: lockedPayment.id },
         data: {
@@ -515,27 +598,27 @@ export class PaymentService {
         },
       });
 
-      // 3. Advance state machine
+      // Advance state machine
       await PaymentStateMachine.transition(tx, lockedPayment.id, targetStatus, {
         reason: `Refund of ${confirmedRefundMinor} confirmed by PayPal (Refund ID: ${refundRes.id})`,
         triggeredBy: params.triggeredBy || 'SYSTEM',
         metadata: {
-          refundId: refundRecord.id,
+          refundId: updatedRefund.id,
           providerRefundId: refundRes.id,
           confirmedRefundMinor,
         },
       });
 
-      // 4. Post Ledger Reversal Journal ONLY after confirmed refund
+      // Post Ledger Reversal Journal ONLY after confirmed refund
       await LedgerService.recordRefundJournal(tx, {
-        refundId: refundRecord.id,
+        refundId: updatedRefund.id,
         amountMinor: confirmedRefundMinor,
         currency: confirmedCurrency,
         providerRefundId: refundRes.id,
         reason: params.reason,
       });
 
-      // 5. If fully refunded, mark Order as REFUNDED
+      // If fully refunded, mark Order as REFUNDED
       if (isFullRefund) {
         await tx.order.update({
           where: { id: lockedPayment.orderId },
@@ -543,11 +626,11 @@ export class PaymentService {
         });
       }
 
-      return refundRecord;
+      return updatedRefund;
     });
 
     return {
-      refund: result,
+      refund: finalRefund,
       payment: await this.getPaymentById(lockedPayment.id),
     };
   }

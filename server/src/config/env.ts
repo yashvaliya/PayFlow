@@ -30,8 +30,9 @@ const envSchema = z
     API_BASE_URL: z.string().default('http://localhost:5001'),
     CORS_ALLOWED_ORIGINS: z.string().default('http://localhost:5173,http://localhost:5001'),
 
-    // PayPal configuration
-    PAYPAL_MODE: z.enum(['sandbox', 'live']).default('sandbox'),
+    // PayPal configuration - strictly sandboxed for safety
+    PAYPAL_MODE: z.literal('sandbox').default('sandbox'),
+    PAYPAL_BASE_URL: z.string().default('https://api-m.sandbox.paypal.com'),
     PAYPAL_CLIENT_ID: z.string().default(''),
     PAYPAL_CLIENT_SECRET: z.string().default(''),
     PAYPAL_WEBHOOK_ID: z.string().default(''),
@@ -41,6 +42,26 @@ const envSchema = z
       .transform((val) => val === 'true'),
   })
   .superRefine((data, ctx) => {
+    // Sandbox Safety: Prevent any accidental real-money / live PayPal configuration
+    if (data.PAYPAL_MODE !== 'sandbox') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Fatal safety check: PayFlow only supports PAYPAL_MODE="sandbox". Real-money payments are forbidden.',
+        path: ['PAYPAL_MODE'],
+      });
+    }
+
+    if (
+      data.PAYPAL_BASE_URL &&
+      (data.PAYPAL_BASE_URL.includes('api.paypal.com') ||
+        (data.PAYPAL_BASE_URL.includes('api-m.paypal.com') && !data.PAYPAL_BASE_URL.includes('sandbox')))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Fatal safety check: Live PayPal base URL detected. Only sandbox.paypal.com endpoints are allowed.',
+        path: ['PAYPAL_BASE_URL'],
+      });
+    }
     // Production security validation
     if (data.NODE_ENV === 'production') {
       if (data.JWT_SECRET === DEFAULT_DEV_JWT_SECRET) {
