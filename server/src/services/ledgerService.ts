@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Prisma, EntryType, AccountType } from '@prisma/client';
 import { prisma } from '../config/prisma.js';
 import { BadRequestError } from '../utils/errors.js';
@@ -70,11 +71,14 @@ export class LedgerService {
     }
 
     // Check if journal for this payment capture already exists (prevent duplicate posting)
-    const existingJournal = await tx.ledgerJournal.findFirst({
+    const existingJournal = await tx.ledgerJournal.findUnique({
       where: {
-        referenceType: 'PAYMENT_CAPTURE',
-        referenceId: params.paymentId,
+        referenceType_referenceId: {
+          referenceType: 'PAYMENT_CAPTURE',
+          referenceId: params.paymentId,
+        },
       },
+      include: { entries: true },
     });
 
     if (existingJournal) {
@@ -92,40 +96,53 @@ export class LedgerService {
     });
 
     const journalNumber = `JRNL-CAP-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const journalId = crypto.randomUUID();
+    const description = `Settlement capture for payment ${params.paymentId}${
+      params.providerCaptureId ? ` (Capture: ${params.providerCaptureId})` : ''
+    }`;
 
-    // Create journal with balanced entries
-    const journal = await tx.ledgerJournal.create({
-      data: {
-        journalNumber,
-        referenceType: 'PAYMENT_CAPTURE',
-        referenceId: params.paymentId,
-        description: `Settlement capture for payment ${params.paymentId}${
-          params.providerCaptureId ? ` (Capture: ${params.providerCaptureId})` : ''
-        }`,
-        entries: {
-          create: [
-            {
-              accountId: paypalClearing.id,
-              entryType: EntryType.DEBIT,
-              amountMinor,
-              currency,
-            },
-            {
-              accountId: merchantPayable.id,
-              entryType: EntryType.CREDIT,
-              amountMinor,
-              currency,
-            },
-          ],
+    // Concurrency-safe atomic insert using PostgreSQL ON CONFLICT DO NOTHING
+    // Prevents transaction abortion (25P02) under simultaneous race conditions
+    const inserted = await tx.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO ledger_journals (id, "journalNumber", "referenceType", "referenceId", description, "postedAt", "createdAt")
+      VALUES (${journalId}, ${journalNumber}, 'PAYMENT_CAPTURE', ${params.paymentId}, ${description}, NOW(), NOW())
+      ON CONFLICT ("referenceType", "referenceId") DO NOTHING
+      RETURNING id
+    `;
+
+    if (inserted.length === 0) {
+      // Conflict occurred: journal already created concurrently! Fetch and return existing
+      return await tx.ledgerJournal.findUniqueOrThrow({
+        where: {
+          referenceType_referenceId: {
+            referenceType: 'PAYMENT_CAPTURE',
+            referenceId: params.paymentId,
+          },
         },
-      },
-      include: {
-        entries: true,
-      },
+        include: { entries: true },
+      });
+    }
+
+    // Newly inserted: create balanced entries and update account running balances
+    await tx.ledgerEntry.createMany({
+      data: [
+        {
+          journalId,
+          accountId: paypalClearing.id,
+          entryType: EntryType.DEBIT,
+          amountMinor,
+          currency,
+        },
+        {
+          journalId,
+          accountId: merchantPayable.id,
+          entryType: EntryType.CREDIT,
+          amountMinor,
+          currency,
+        },
+      ],
     });
 
-    // Update account running balances
-    // For Asset: DEBIT increases balance
     await tx.ledgerAccount.update({
       where: { id: paypalClearing.id },
       data: {
@@ -133,7 +150,6 @@ export class LedgerService {
       },
     });
 
-    // For Liability: CREDIT increases balance
     await tx.ledgerAccount.update({
       where: { id: merchantPayable.id },
       data: {
@@ -141,7 +157,10 @@ export class LedgerService {
       },
     });
 
-    return journal;
+    return await tx.ledgerJournal.findUniqueOrThrow({
+      where: { id: journalId },
+      include: { entries: true },
+    });
   }
 
   /**
@@ -166,12 +185,15 @@ export class LedgerService {
       throw new BadRequestError(`Invalid refund amount: ${amountMinor}`);
     }
 
-    // Check duplicate posting
-    const existingJournal = await tx.ledgerJournal.findFirst({
+    // Check duplicate posting using database unique constraint index
+    const existingJournal = await tx.ledgerJournal.findUnique({
       where: {
-        referenceType: 'PAYMENT_REFUND',
-        referenceId: params.refundId,
+        referenceType_referenceId: {
+          referenceType: 'PAYMENT_REFUND',
+          referenceId: params.refundId,
+        },
       },
+      include: { entries: true },
     });
 
     if (existingJournal) {
@@ -188,40 +210,52 @@ export class LedgerService {
     });
 
     const journalNumber = `JRNL-REF-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const journalId = crypto.randomUUID();
+    const description = `Refund reversal for refund ${params.refundId}${
+      params.providerRefundId ? ` (Provider ID: ${params.providerRefundId})` : ''
+    }${params.reason ? `: ${params.reason}` : ''}`;
 
-    // Debit Merchant Payable, Credit PayPal Clearing
-    const journal = await tx.ledgerJournal.create({
-      data: {
-        journalNumber,
-        referenceType: 'PAYMENT_REFUND',
-        referenceId: params.refundId,
-        description: `Refund reversal for refund ${params.refundId}${
-          params.providerRefundId ? ` (Provider ID: ${params.providerRefundId})` : ''
-        }${params.reason ? `: ${params.reason}` : ''}`,
-        entries: {
-          create: [
-            {
-              accountId: merchantPayable.id,
-              entryType: EntryType.DEBIT,
-              amountMinor,
-              currency,
-            },
-            {
-              accountId: paypalClearing.id,
-              entryType: EntryType.CREDIT,
-              amountMinor,
-              currency,
-            },
-          ],
+    // Concurrency-safe atomic insert using PostgreSQL ON CONFLICT DO NOTHING
+    const inserted = await tx.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO ledger_journals (id, "journalNumber", "referenceType", "referenceId", description, "postedAt", "createdAt")
+      VALUES (${journalId}, ${journalNumber}, 'PAYMENT_REFUND', ${params.refundId}, ${description}, NOW(), NOW())
+      ON CONFLICT ("referenceType", "referenceId") DO NOTHING
+      RETURNING id
+    `;
+
+    if (inserted.length === 0) {
+      // Conflict occurred: refund journal already created concurrently! Fetch and return existing
+      return await tx.ledgerJournal.findUniqueOrThrow({
+        where: {
+          referenceType_referenceId: {
+            referenceType: 'PAYMENT_REFUND',
+            referenceId: params.refundId,
+          },
         },
-      },
-      include: {
-        entries: true,
-      },
+        include: { entries: true },
+      });
+    }
+
+    // Newly inserted: create balanced entries and update account running balances
+    await tx.ledgerEntry.createMany({
+      data: [
+        {
+          journalId,
+          accountId: merchantPayable.id,
+          entryType: EntryType.DEBIT,
+          amountMinor,
+          currency,
+        },
+        {
+          journalId,
+          accountId: paypalClearing.id,
+          entryType: EntryType.CREDIT,
+          amountMinor,
+          currency,
+        },
+      ],
     });
 
-    // Update balances
-    // For Liability: DEBIT decreases balance
     await tx.ledgerAccount.update({
       where: { id: merchantPayable.id },
       data: {
@@ -229,7 +263,6 @@ export class LedgerService {
       },
     });
 
-    // For Asset: CREDIT decreases balance
     await tx.ledgerAccount.update({
       where: { id: paypalClearing.id },
       data: {
@@ -237,7 +270,10 @@ export class LedgerService {
       },
     });
 
-    return journal;
+    return await tx.ledgerJournal.findUniqueOrThrow({
+      where: { id: journalId },
+      include: { entries: true },
+    });
   }
 
   /**

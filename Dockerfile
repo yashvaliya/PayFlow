@@ -41,4 +41,4 @@ COPY --from=builder /app/client/dist ./client/dist
 
 EXPOSE 5001
 
-CMD ["sh", "-c", "npx prisma db push --schema=server/prisma/schema.prisma && node server/dist/server.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy --schema=server/prisma/schema.prisma && node server/dist/server.js"]

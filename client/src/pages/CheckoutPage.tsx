@@ -50,8 +50,10 @@ export const CheckoutPage: React.FC = () => {
   // Set default product in cart once loaded
   React.useEffect(() => {
     if (products.length > 0 && Object.keys(cart).length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setCart({ [products[0].id]: 1 });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [products]);
 
   const updateQuantity = (productId: string, delta: number) => {
