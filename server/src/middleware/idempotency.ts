@@ -38,11 +38,11 @@ export function computeRequestHash(payload: any): string {
  * 
  * Enforces:
  * - Presence of Idempotency-Key header
- * - User/session isolation (prevents cross-user response replay)
+ * - Exact user/session isolation including authenticated-vs-guest distinction
  * - Operation identity validation (same key cannot be reused across different operations)
  * - Recursive request payload hash validation (returns 409 Conflict if payload differs)
- * - In-flight concurrency lock with stale lock recovery
- * - Recovery of unlocked records without saved responses
+ * - In-flight concurrency lock with atomic stale lock recovery
+ * - Recovery of unlocked records without saved responses (verified payload match first)
  * - Reliable response persistence before transmitting HTTP response over the wire
  * - Response caching and transparent replay with X-Idempotent-Replay header
  */
@@ -59,7 +59,7 @@ export function idempotency(operationName: string) {
     const trimmedKey = idempotencyKey.trim();
     const requestPayload = req.body || {};
     const requestHash = computeRequestHash(requestPayload);
-    const currentUserId = (req as any).user?.id || (req as any).session?.userId || null;
+    const currentUserId = (req as any).user?.id || null;
 
     try {
       // 1. Check existing record
@@ -68,8 +68,10 @@ export function idempotency(operationName: string) {
       });
 
       if (existing) {
-        // Prevent cross-user / cross-session response replay
-        if (existing.userId && currentUserId && existing.userId !== currentUserId) {
+        // Enforce exact user/session identity, including authenticated-vs-guest distinction.
+        // A guest (null userId) cannot access a key registered by an authenticated user, and vice versa.
+        const existingUserId = existing.userId ?? null;
+        if (existingUserId !== currentUserId) {
           throw new ConflictError(
             `Idempotency-Key "${trimmedKey}" was registered by another user and cannot be reused or accessed.`
           );
@@ -91,18 +93,39 @@ export function idempotency(operationName: string) {
           !existing.isLocked && (existing.responseStatus === null || existing.responseBody === null);
 
         if (isStaleLock || isUnlockedWithoutResponse) {
-          // Re-claim and recover the record for execution
-          await prisma.idempotencyRecord.update({
-            where: { key: trimmedKey },
+          // NEVER replace the existing request hash before verifying the incoming payload matches.
+          // If the record already has a requestHash, verify the incoming payload matches it.
+          if (existing.requestHash && existing.requestHash !== requestHash) {
+            throw new ConflictError(
+              `Idempotency-Key "${trimmedKey}" was previously used with a different request payload.`
+            );
+          }
+
+          // Atomic stale-lock recovery using conditional database update.
+          // The WHERE clause ensures only the specific stale/crashed state is reclaimed,
+          // preventing TOCTOU races where another worker concurrently reclaims the same record.
+          const reclaimed = await prisma.idempotencyRecord.updateMany({
+            where: {
+              key: trimmedKey,
+              // Match only the exact state we inspected — atomic CAS
+              ...(isStaleLock
+                ? { isLocked: true, lockedAt: existing.lockedAt }
+                : { isLocked: false, responseStatus: null }),
+            },
             data: {
               isLocked: true,
               lockedAt: new Date(),
-              operation: operationName,
               requestHash,
               requestPayload,
-              userId: currentUserId || existing.userId,
             },
           });
+
+          if (reclaimed.count === 0) {
+            // Another request already reclaimed this record — treat as in-flight conflict
+            throw new ConflictError(
+              `A request with Idempotency-Key "${trimmedKey}" is currently being processed. Please retry shortly.`
+            );
+          }
         } else {
           // Validate payload hash match for active or completed requests
           if (existing.requestHash !== requestHash) {

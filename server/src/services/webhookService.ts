@@ -284,9 +284,33 @@ export class WebhookService {
       return;
     }
 
-    const refundAmountMinor = dollarsToCents(resource.amount?.value || '0');
+    // Only accept explicit COMPLETED status from PayPal. Reject missing or unexpected statuses.
+    const refundStatus = resource.status;
+    if (refundStatus !== 'COMPLETED') {
+      throw new Error(
+        `Financial validation failed: Webhook refund ${refundId} has non-COMPLETED status "${refundStatus || 'MISSING'}". Refusing to post ledger entries.`
+      );
+    }
+
+    // Require explicit amount and currency from the webhook payload
+    if (!resource.amount?.value || !resource.amount?.currency_code) {
+      throw new Error(
+        `Financial validation failed: Webhook refund ${refundId} missing required amount or currency_code fields`
+      );
+    }
+
+    const refundAmountMinor = dollarsToCents(resource.amount.value);
+    const refundCurrency = resource.amount.currency_code;
+
     if (refundAmountMinor <= 0) {
-      throw new Error(`Financial validation failed: Invalid refund amount in webhook: ${resource.amount?.value}`);
+      throw new Error(`Financial validation failed: Invalid refund amount in webhook: ${resource.amount.value}`);
+    }
+
+    // Validate currency matches the payment currency
+    if (refundCurrency !== payment.currency) {
+      throw new Error(
+        `Financial validation failed: Webhook refund currency mismatch for ${refundId}: expected ${payment.currency}, received ${refundCurrency}`
+      );
     }
 
     await prisma.$transaction(async (tx) => {
@@ -322,7 +346,7 @@ export class WebhookService {
             idempotencyKey: `IDEM-WEBHOOK-REF-${refundId}`,
             providerRefundId: refundId,
             amountMinor: refundAmountMinor,
-            currency: resource.amount?.currency_code || payment.currency,
+            currency: refundCurrency,
             status: RefundStatus.COMPLETED,
             rawProviderData: resource,
           },
@@ -350,7 +374,7 @@ export class WebhookService {
       await LedgerService.recordRefundJournal(tx, {
         refundId: refundRecord.id,
         amountMinor: refundAmountMinor,
-        currency: resource.amount?.currency_code || payment.currency,
+        currency: refundCurrency,
         providerRefundId: refundId,
         reason: 'Webhook confirmed refund',
       });

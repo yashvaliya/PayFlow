@@ -281,6 +281,7 @@ model WebhookEvent {
   processingAttempts Int           @default(0)
   lastError          String?
   receivedAt         DateTime      @default(now())
+  claimedAt          DateTime?     // Lease timestamp set atomically when a worker claims this event
   processedAt        DateTime?
 
   @@index([eventId])

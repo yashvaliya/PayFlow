@@ -5,6 +5,7 @@ import { prisma } from '../../src/config/prisma.js';
 import { payPalClient } from '../../src/integrations/paypal/client.js';
 import { LedgerService } from '../../src/services/ledgerService.js';
 import { WebhookWorker } from '../../src/workers/webhookWorker.js';
+import { computeRequestHash } from '../../src/middleware/idempotency.js';
 import { PaymentStatus, RefundStatus, WebhookStatus, EntryType } from '@prisma/client';
 
 describe('Regression Tests: 6 Remaining Fintech Hardening Issues', () => {
@@ -416,11 +417,12 @@ describe('Regression Tests: 6 Remaining Fintech Hardening Issues', () => {
       };
 
       // Simulate a crashed request: unlocked record with null response
+      // Use the actual hash of the payload that will be sent for recovery
       await prisma.idempotencyRecord.create({
         data: {
           key: crashedKey,
           operation: 'CREATE_ORDER',
-          requestHash: 'placeholder-hash',
+          requestHash: computeRequestHash(payload),
           isLocked: false, // unlocked
           responseStatus: null, // no saved response
           responseBody: null,

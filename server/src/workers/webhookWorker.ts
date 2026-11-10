@@ -7,6 +7,7 @@ export class WebhookWorker {
   private static pollTimer: NodeJS.Timeout | null = null;
   private static isProcessing = false;
   public static readonly MAX_ATTEMPTS = 5;
+  private static readonly LEASE_TIMEOUT_MS = 120_000; // 2 minutes
 
   /**
    * Starts the persistent background PostgreSQL-backed webhook worker.
@@ -15,9 +16,11 @@ export class WebhookWorker {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    // Run recovery and queue polling
-    this.pollTimer = setInterval(async () => {
-      await this.processNextBatch();
+    // Run recovery and queue polling — wrap callback in error handler
+    this.pollTimer = setInterval(() => {
+      this.processNextBatch().catch((err) => {
+        console.error('Webhook worker polling tick failed:', err);
+      });
     }, pollIntervalMs);
 
     // Initial immediate tick
@@ -67,6 +70,8 @@ export class WebhookWorker {
         await this.executeClaimedEvent(claimed);
         processedCount++;
       }
+    } catch (err) {
+      console.error('Webhook worker batch processing error:', err);
     } finally {
       this.isProcessing = false;
     }
@@ -76,8 +81,9 @@ export class WebhookWorker {
 
   /**
    * Atomic PostgreSQL event claiming using FOR UPDATE SKIP LOCKED.
-   * Handles atomic status transition to PROCESSING, increments processingAttempts,
-   * and recovers stale processing events (lease > 2 minutes).
+   * Uses a dedicated `claimedAt` lease timestamp (NOT receivedAt) for stale-processing detection.
+   * Sets claimedAt atomically in the same UPDATE to prevent concurrent workers from
+   * reclaiming an actively processed event.
    */
   public static async claimNextEvent(): Promise<{
     id: string;
@@ -86,6 +92,8 @@ export class WebhookWorker {
     payload: any;
     processingAttempts: number;
   } | null> {
+    const leaseTimeoutMs = this.LEASE_TIMEOUT_MS;
+
     const claimedRows = await prisma.$queryRaw<Array<{
       id: string;
       eventId: string;
@@ -95,12 +103,16 @@ export class WebhookWorker {
     }>>`
       UPDATE webhook_events
       SET status = 'PROCESSING'::"WebhookStatus",
-          "processingAttempts" = "processingAttempts" + 1
+          "processingAttempts" = "processingAttempts" + 1,
+          "claimedAt" = NOW()
       WHERE id = (
         SELECT id
         FROM webhook_events
         WHERE (status = 'PENDING'::"WebhookStatus" AND "processingAttempts" < ${this.MAX_ATTEMPTS})
-           OR (status = 'PROCESSING'::"WebhookStatus" AND "receivedAt" < NOW() - INTERVAL '2 minutes' AND "processingAttempts" < ${this.MAX_ATTEMPTS})
+           OR (status = 'PROCESSING'::"WebhookStatus"
+               AND "claimedAt" IS NOT NULL
+               AND "claimedAt" < NOW() - (${leaseTimeoutMs} || ' milliseconds')::INTERVAL
+               AND "processingAttempts" < ${this.MAX_ATTEMPTS})
         ORDER BY "receivedAt" ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED

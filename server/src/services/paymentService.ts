@@ -512,18 +512,6 @@ export class PaymentService {
       throw new BadRequestError('PayPal did not return a valid refund reference ID');
     }
 
-    // Provider explicitly refused / failed the refund: release reservation by marking FAILED
-    if (refundRes.status === 'FAILED') {
-      await prisma.refund.update({
-        where: { id: reservedRefund.id },
-        data: {
-          status: RefundStatus.FAILED,
-          rawProviderData: refundRes as any,
-        },
-      });
-      throw new BadRequestError(`PayPal refund was not completed: provider returned status "FAILED"`);
-    }
-
     // Provider returned PENDING: keep reservation active in PENDING status, awaiting webhook confirmation
     if (refundRes.status === 'PENDING') {
       await prisma.$transaction(async (tx) => {
@@ -547,9 +535,37 @@ export class PaymentService {
       };
     }
 
-    // Validate confirmed refund amount and currency
-    const confirmedRefundMinor = dollarsToCents(refundRes.amount?.value || '0');
-    const confirmedCurrency = refundRes.amount?.currency_code || lockedPayment.currency;
+    // Reject ANY status that is not explicitly COMPLETED — including FAILED, missing, or unexpected values.
+    // Only an explicit 'COMPLETED' from PayPal is safe to post ledger entries against.
+    if (refundRes.status !== 'COMPLETED') {
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          status: RefundStatus.FAILED,
+          rawProviderData: refundRes as any,
+        },
+      });
+      throw new BadRequestError(
+        `PayPal refund was not completed: provider returned status "${refundRes.status || 'MISSING'}"`
+      );
+    }
+
+    // Validate confirmed refund amount and currency — require explicit values, never default
+    if (!refundRes.amount?.value || !refundRes.amount?.currency_code) {
+      await prisma.refund.update({
+        where: { id: reservedRefund.id },
+        data: {
+          status: RefundStatus.FAILED,
+          rawProviderData: refundRes as any,
+        },
+      });
+      throw new BadRequestError(
+        'PayPal refund response missing required amount or currency_code fields'
+      );
+    }
+
+    const confirmedRefundMinor = dollarsToCents(refundRes.amount.value);
+    const confirmedCurrency = refundRes.amount.currency_code;
 
     if (confirmedRefundMinor !== requestedRefund || confirmedCurrency !== lockedPayment.currency) {
       await prisma.refund.update({
