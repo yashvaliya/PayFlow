@@ -7,7 +7,7 @@
 
 A full-stack payment processing platform built with **React**, **Node/Express**, **PostgreSQL**, and the **PayPal REST API**.
 
-Built by **Yash Valiya** to study how real-world fintech systems handle money, failure states, and accounting without rounding errors or duplicate charges.
+Built to study how real-world fintech systems handle money, failure states, and accounting without rounding errors or duplicate charges.
 
 ---
 
