@@ -16,6 +16,7 @@ import { prisma } from '../../src/config/prisma.js';
  */
 describe('Idempotency Response Persistence', () => {
   let testProductId: string;
+  let testProductPriceMinor: number;
 
   // Capture the original prisma update function ONCE before any mocking
   const originalPrismaUpdate = (...args: any[]) =>
@@ -27,6 +28,7 @@ describe('Idempotency Response Persistence', () => {
     const prodRes = await request(app).get('/api/products');
     const prod = prodRes.body.data.products[0];
     testProductId = prod.id;
+    testProductPriceMinor = prod.unitAmountMinor;
   });
 
   afterAll(async () => {
@@ -192,13 +194,23 @@ describe('Idempotency Response Persistence', () => {
     // Stale-lock recovery must NOT duplicate the payment operation; it safely replays the completed result
     expect(res3.status).toBe(201);
     expect(res3.headers['x-idempotent-replay']).toBe('true');
+    expect(res3.body.success).toBe(true);
     expect(res3.body.data.orderId).toBeDefined();
+    expect(res3.body.data.orderNumber).toBeDefined();
+    expect(typeof res3.body.data.orderNumber).toBe('string');
+    expect(res3.body.data.paymentId).toBeDefined();
+    expect(res3.body.data.providerOrderId).toBeDefined();
+    expect(res3.body.data.totalAmountMinor).toBe(testProductPriceMinor);
+    expect(res3.body.data.currency).toBe('USD');
+    expect(res3.body.data.approvalUrl).toBeDefined();
+    expect(res3.body.data.status).toBe('PENDING_APPROVAL');
 
     // Verify order count is STILL exactly 1 (no duplicate operation occurred after lock expiry)
     const ordersFinal = await prisma.order.count({
       where: { customerEmail: email },
     });
     expect(ordersFinal).toBe(ordersBefore);
+    expect(ordersFinal).toBe(1);
   });
 
   // =========================================================================

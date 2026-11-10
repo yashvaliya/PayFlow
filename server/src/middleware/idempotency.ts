@@ -17,6 +17,7 @@ async function findCompletedOperationResponse(
   if (operation === 'CREATE_ORDER') {
     const payment = await prisma.payment.findUnique({
       where: { idempotencyKey: key },
+      include: { order: true },
     });
     if (payment) {
       const rawData = payment.rawProviderData as any;
@@ -27,12 +28,13 @@ async function findCompletedOperationResponse(
           success: true,
           data: {
             orderId: payment.orderId,
+            orderNumber: payment.order.orderNumber,
             paymentId: payment.id,
-            amountMinor: payment.amountMinor,
+            providerOrderId: payment.providerOrderId,
+            totalAmountMinor: payment.amountMinor,
             currency: payment.currency,
-            status: payment.status,
             approvalUrl,
-            payPalOrderId: payment.providerOrderId,
+            status: payment.status,
           },
         },
       };
