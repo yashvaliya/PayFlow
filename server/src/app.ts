@@ -31,12 +31,34 @@ app.use(
   })
 );
 
-// CORS configuration
+// CORS configuration with explicit origin allowlist
+const rawAllowedOrigins = [
+  ...env.CORS_ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean),
+  env.APP_BASE_URL.trim(),
+];
+const allowedOrigins = Array.from(new Set(rawAllowedOrigins));
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow local development, self origin, or deployed domains
-      callback(null, true);
+      // Allow server-to-server or non-browser requests without origin header (e.g. PayPal webhooks, curl)
+      if (!origin) {
+        return callback(null, true);
+      }
+      if (env.NODE_ENV === 'development' || env.NODE_ENV === 'test') {
+        if (
+          origin.startsWith('http://localhost:') ||
+          origin.startsWith('http://127.0.0.1:') ||
+          allowedOrigins.includes(origin)
+        ) {
+          return callback(null, true);
+        }
+      } else {
+        if (allowedOrigins.includes(origin)) {
+          return callback(null, true);
+        }
+      }
+      return callback(new Error(`Origin "${origin}" is not allowed by CORS`));
     },
     credentials: true,
   })

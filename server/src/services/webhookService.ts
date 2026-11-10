@@ -1,4 +1,4 @@
-import { Prisma, WebhookStatus, PaymentStatus } from '@prisma/client';
+import { WebhookStatus, PaymentStatus, RefundStatus } from '@prisma/client';
 import { prisma } from '../config/prisma.js';
 import { payPalClient } from '../integrations/paypal/client.js';
 import { PaymentStateMachine } from './stateMachine.js';
@@ -7,7 +7,8 @@ import { dollarsToCents } from '../utils/money.js';
 
 export class WebhookService {
   /**
-   * Durable acceptance and deduplication of webhook event
+   * Durable acceptance and deduplication of webhook event.
+   * Fails closed if signature verification does not succeed.
    */
   public static async receiveAndQueueWebhook(params: {
     headers: Record<string, string | string[] | undefined>;
@@ -21,7 +22,7 @@ export class WebhookService {
       throw new Error('Received webhook payload without an event id');
     }
 
-    // 1. Signature Verification
+    // 1. Signature Verification - FAILS CLOSED
     const authAlgo = String(params.headers['paypal-auth-algo'] || '');
     const certUrl = String(params.headers['paypal-cert-url'] || '');
     const transmissionId = String(params.headers['paypal-transmission-id'] || '');
@@ -56,17 +57,32 @@ export class WebhookService {
       };
     }
 
-    // 3. Persist event durably with PENDING status
-    const createdEvent = await prisma.webhookEvent.create({
-      data: {
-        eventId,
-        eventType: event.event_type || 'UNKNOWN',
-        resourceType: event.resource_type || null,
-        summary: event.summary || null,
-        payload: event,
-        status: WebhookStatus.PENDING,
-      },
-    });
+    // 3. Persist event durably with PENDING status (with race-condition catch for concurrent delivery)
+    let createdEvent;
+    try {
+      createdEvent = await prisma.webhookEvent.create({
+        data: {
+          eventId,
+          eventType: event.event_type || 'UNKNOWN',
+          resourceType: event.resource_type || null,
+          summary: event.summary || null,
+          payload: event,
+          status: WebhookStatus.PENDING,
+        },
+      });
+    } catch (createErr: any) {
+      if (createErr.code === 'P2002') {
+        const raceExisting = await prisma.webhookEvent.findUnique({
+          where: { eventId },
+        });
+        return {
+          event: raceExisting!,
+          duplicate: true,
+          status: raceExisting?.status || WebhookStatus.PENDING,
+        };
+      }
+      throw createErr;
+    }
 
     // 4. Trigger asynchronous background processing
     setImmediate(() => {
@@ -83,7 +99,8 @@ export class WebhookService {
   }
 
   /**
-   * Asynchronous event worker that settles payments and maintains ledger consistency
+   * Asynchronous event worker that settles payments and maintains ledger consistency.
+   * Ensures idempotency: duplicate events will never create duplicate financial entries.
    */
   public static async processEventAsync(webhookRecordId: string) {
     const record = await prisma.webhookEvent.findUnique({
@@ -121,7 +138,6 @@ export class WebhookService {
         }
 
         default: {
-          console.info(`Webhook event type ${eventType} ignored (not relevant to settlement)`);
           await prisma.webhookEvent.update({
             where: { id: webhookRecordId },
             data: {
@@ -155,7 +171,8 @@ export class WebhookService {
 
   private static async handlePaymentCaptureCompleted(resource: any) {
     const captureId = resource.id;
-    // Find payment by captureId or supplementary order reference
+    if (!captureId) return;
+
     let payment = await prisma.payment.findFirst({
       where: {
         OR: [
@@ -171,12 +188,29 @@ export class WebhookService {
     }
 
     if (payment.status === PaymentStatus.COMPLETED) {
-      // Already completed and settled by synchronous capture endpoint, no duplicate ledger post
+      // Already completed and settled; do not create duplicate ledger entries
       return;
     }
 
-    // Settle payment in transaction
+    // Validate amount and currency
+    const webhookAmountMinor = dollarsToCents(resource.amount?.value || '0');
+    const webhookCurrency = resource.amount?.currency_code || 'USD';
+
+    if (webhookAmountMinor !== payment.amountMinor || webhookCurrency !== payment.currency) {
+      console.error(
+        `Webhook capture amount mismatch for payment ${payment.id}: expected ${payment.amountMinor} ${payment.currency}, got ${webhookAmountMinor} ${webhookCurrency}`
+      );
+      return;
+    }
+
+    // Atomically settle payment in transaction with lock verification
     await prisma.$transaction(async (tx) => {
+      // Re-verify status within transaction to prevent race conditions
+      const current = await tx.payment.findUniqueOrThrow({ where: { id: payment.id } });
+      if (current.status === PaymentStatus.COMPLETED) {
+        return;
+      }
+
       await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.COMPLETED, {
         reason: `Capture confirmed by PayPal Webhook (Capture ID: ${captureId})`,
         triggeredBy: 'WEBHOOK',
@@ -191,6 +225,7 @@ export class WebhookService {
         },
       });
 
+      // Post Double-Entry Journal (idempotently verified inside recordCaptureJournal)
       await LedgerService.recordCaptureJournal(tx, {
         paymentId: payment.id,
         amountMinor: payment.amountMinor,
@@ -216,8 +251,13 @@ export class WebhookService {
       },
     });
 
-    if (payment && payment.status !== PaymentStatus.COMPLETED) {
+    if (payment && payment.status !== PaymentStatus.COMPLETED && payment.status !== PaymentStatus.REFUNDED) {
       await prisma.$transaction(async (tx) => {
+        const current = await tx.payment.findUniqueOrThrow({ where: { id: payment.id } });
+        if (current.status === PaymentStatus.COMPLETED || current.status === PaymentStatus.FAILED) {
+          return;
+        }
+
         await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.FAILED, {
           reason: `Capture denied by PayPal Webhook`,
           triggeredBy: 'WEBHOOK',
@@ -234,6 +274,8 @@ export class WebhookService {
 
   private static async handlePaymentCaptureRefunded(resource: any) {
     const refundId = resource.id;
+    if (!refundId) return;
+
     const captureId = resource.links?.find((l: any) => l.rel === 'up')?.href?.split('/').pop();
 
     const payment = await prisma.payment.findFirst({
@@ -248,50 +290,104 @@ export class WebhookService {
 
     if (!payment) return;
 
-    // Check if refund record exists
+    // Check if refund record already exists (prevent duplicate ledger entries)
     const existingRefund = payment.refunds.find((r) => r.providerRefundId === refundId);
-    if (!existingRefund) {
-      const refundAmountMinor = dollarsToCents(resource.amount?.value || '0');
-      const isFullRefund = payment.refundedAmountMinor + refundAmountMinor >= payment.amountMinor;
+    if (existingRefund) {
+      return;
+    }
 
-      await prisma.$transaction(async (tx) => {
-        const refundRecord = await tx.refund.create({
-          data: {
-            paymentId: payment.id,
-            idempotencyKey: `IDEM-WEBHOOK-REF-${refundId}`,
-            providerRefundId: refundId,
-            amountMinor: refundAmountMinor,
-            currency: resource.amount?.currency_code || 'USD',
-            status: 'COMPLETED',
-            rawProviderData: resource,
-          },
-        });
+    const refundAmountMinor = dollarsToCents(resource.amount?.value || '0');
+    if (refundAmountMinor <= 0) return;
 
-        await tx.payment.update({
-          where: { id: payment.id },
-          data: {
-            refundedAmountMinor: { increment: refundAmountMinor },
-          },
-        });
+    await prisma.$transaction(async (tx) => {
+      // Re-verify existing refund within transaction
+      const raceRefund = await tx.refund.findFirst({
+        where: { providerRefundId: refundId },
+      });
+      if (raceRefund) return;
 
-        await PaymentStateMachine.transition(
-          tx,
-          payment.id,
-          isFullRefund ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED,
-          {
-            reason: `Refund registered via Webhook: ${refundId}`,
-            triggeredBy: 'WEBHOOK',
-          }
-        );
+      const currentPayment = await tx.payment.findUniqueOrThrow({ where: { id: payment.id } });
+      const available = currentPayment.amountMinor - currentPayment.refundedAmountMinor;
+      if (refundAmountMinor > available) {
+        console.error(`Webhook refund of ${refundAmountMinor} exceeds available ${available}`);
+        return;
+      }
 
-        await LedgerService.recordRefundJournal(tx, {
-          refundId: refundRecord.id,
-          amountMinor: refundAmountMinor,
-          currency: payment.currency,
+      const isFullRefund = currentPayment.refundedAmountMinor + refundAmountMinor >= currentPayment.amountMinor;
+
+      const refundRecord = await tx.refund.create({
+        data: {
+          paymentId: payment.id,
+          idempotencyKey: `IDEM-WEBHOOK-REF-${refundId}`,
           providerRefundId: refundId,
+          amountMinor: refundAmountMinor,
+          currency: resource.amount?.currency_code || payment.currency,
+          status: RefundStatus.COMPLETED,
+          rawProviderData: resource,
+        },
+      });
+
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: {
+          refundedAmountMinor: { increment: refundAmountMinor },
+        },
+      });
+
+      await PaymentStateMachine.transition(
+        tx,
+        payment.id,
+        isFullRefund ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED,
+        {
+          reason: `Refund registered via Webhook: ${refundId}`,
+          triggeredBy: 'WEBHOOK',
+        }
+      );
+
+      // Post Ledger Reversal Journal
+      await LedgerService.recordRefundJournal(tx, {
+        refundId: refundRecord.id,
+        amountMinor: refundAmountMinor,
+        currency: payment.currency,
+        providerRefundId: refundId,
+      });
+
+      if (isFullRefund) {
+        await tx.order.update({
+          where: { id: payment.orderId },
+          data: { status: 'REFUNDED' },
+        });
+      }
+    });
+  }
+
+  /**
+   * Recovers any unhandled PENDING webhook events after application startup or crash.
+   * Simple, reliable PostgreSQL-backed solution.
+   */
+  public static async recoverPendingEvents(): Promise<number> {
+    const pendingEvents = await prisma.webhookEvent.findMany({
+      where: {
+        status: WebhookStatus.PENDING,
+        processingAttempts: { lt: 5 },
+      },
+      take: 50,
+      orderBy: { receivedAt: 'asc' },
+    });
+
+    if (pendingEvents.length > 0) {
+      console.log(`Recovering ${pendingEvents.length} pending webhook events from PostgreSQL...`);
+    }
+
+    for (const evt of pendingEvents) {
+      setImmediate(() => {
+        this.processEventAsync(evt.id).catch((err) => {
+          console.error(`Failed recovering webhook event ${evt.eventId}:`, err);
         });
       });
     }
+
+    return pendingEvents.length;
   }
 
   /**

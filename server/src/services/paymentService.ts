@@ -4,6 +4,7 @@ import { payPalClient } from '../integrations/paypal/client.js';
 import { PaymentStateMachine } from './stateMachine.js';
 import { LedgerService } from './ledgerService.js';
 import { BadRequestError, NotFoundError } from '../utils/errors.js';
+import { dollarsToCents } from '../utils/money.js';
 
 export interface CreatePaymentOrderInput {
   items: Array<{ productId: string; quantity: number }>;
@@ -167,6 +168,7 @@ export class PaymentService {
 
   /**
    * 2. Capture and Settle Payment with Double-Entry Accounting
+   * Verifies provider order ID, capture ID, actual status, and exact amount/currency match.
    */
   public static async capturePayment(params: {
     paymentId: string;
@@ -202,24 +204,53 @@ export class PaymentService {
     }
 
     // Call PayPal capture API
-    const captureResult = await payPalClient.captureOrder({
-      providerOrderId: payment.providerOrderId,
-      idempotencyKey: params.idempotencyKey,
-    });
+    let captureResult;
+    try {
+      captureResult = await payPalClient.captureOrder({
+        providerOrderId: payment.providerOrderId,
+        idempotencyKey: params.idempotencyKey,
+        expectedAmountMinor: payment.amountMinor,
+        expectedCurrency: payment.currency,
+      });
+    } catch (captureErr: any) {
+      // If order was already captured on PayPal (e.g. concurrent duplicate request or network retry),
+      // fetch authoritative order details and verify rather than blindly failing
+      if (captureErr.statusCode === 422 || captureErr.message?.includes('ORDER_ALREADY_CAPTURED')) {
+        const orderDetails = await payPalClient.getOrderDetails(payment.providerOrderId).catch(() => null);
+        if (orderDetails && (orderDetails.status === 'COMPLETED' || orderDetails.status === 'APPROVED')) {
+          const fresh = await prisma.payment.findUnique({ where: { id: payment.id } });
+          if (fresh && fresh.status === PaymentStatus.COMPLETED) {
+            return this.getPaymentById(payment.id);
+          }
+        }
+      }
+      throw captureErr;
+    }
 
-    const captureItem =
-      captureResult.purchase_units?.[0]?.payments?.captures?.[0];
+    // 1. Verify Provider Order ID matches
+    if (captureResult.id && captureResult.id !== payment.providerOrderId) {
+      throw new BadRequestError(
+        `PayPal Order ID mismatch: expected "${payment.providerOrderId}", received "${captureResult.id}"`
+      );
+    }
+
+    // 2. Extract and verify capture item and ID
+    const captureItem = captureResult.purchase_units?.[0]?.payments?.captures?.[0];
     const providerCaptureId = captureItem?.id;
     const providerStatus = captureItem?.status || captureResult.status;
 
-    if (providerStatus !== 'COMPLETED' && captureResult.status !== 'COMPLETED') {
-      // Mark failed
+    if (!providerCaptureId) {
+      throw new BadRequestError('PayPal capture response is missing an authoritative capture ID');
+    }
+
+    // 3. Verify capture status confirmed
+    if (providerStatus !== 'COMPLETED') {
       await prisma.$transaction(async (tx) => {
         await tx.payment.update({
           where: { id: payment.id },
           data: {
             providerStatus,
-            failureReason: `Capture status not completed: ${providerStatus}`,
+            failureReason: `Capture status not completed by provider: ${providerStatus}`,
             rawProviderData: captureResult as any,
           },
         });
@@ -228,20 +259,56 @@ export class PaymentService {
           triggeredBy: params.triggeredBy || 'PAYPAL_API',
         });
       });
-
       throw new BadRequestError(`Payment capture was not completed by PayPal: ${providerStatus}`);
     }
 
-    // Atomically complete payment, post double-entry ledger journals, and update order
+    // 4. Validate captured amount and currency against authoritative payment
+    if (!captureItem.amount || !captureItem.amount.value || !captureItem.amount.currency_code) {
+      throw new BadRequestError('PayPal capture response is missing amount or currency information');
+    }
+
+    const capturedAmountMinor = dollarsToCents(captureItem.amount.value);
+    const capturedCurrency = captureItem.amount.currency_code;
+
+    if (capturedAmountMinor !== payment.amountMinor || capturedCurrency !== payment.currency) {
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: {
+            failureReason: `Amount/currency mismatch: expected ${payment.amountMinor} ${payment.currency}, captured ${capturedAmountMinor} ${capturedCurrency}`,
+            rawProviderData: captureResult as any,
+          },
+        });
+        await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.FAILED, {
+          reason: `Amount/currency mismatch: expected ${payment.amountMinor} ${payment.currency}, captured ${capturedAmountMinor} ${capturedCurrency}`,
+          triggeredBy: 'SYSTEM_VALIDATION',
+        });
+      });
+
+      throw new BadRequestError(
+        `Capture amount or currency mismatch: expected ${payment.amountMinor} ${payment.currency}, received ${capturedAmountMinor} ${capturedCurrency}`
+      );
+    }
+
+    // 5. Atomically complete payment, post double-entry ledger journals, and update order
     await prisma.$transaction(async (tx) => {
-      // 1. Advance state machine
+      // Re-verify current status inside transaction to guard against concurrent duplicate capture
+      const current = await tx.payment.findUniqueOrThrow({
+        where: { id: payment.id },
+      });
+
+      if (current.status === PaymentStatus.COMPLETED) {
+        return; // Already settled concurrently, avoid duplicate ledger posting
+      }
+
+      // Advance state machine
       await PaymentStateMachine.transition(tx, payment.id, PaymentStatus.COMPLETED, {
         reason: `Payment captured successfully via PayPal (Capture ID: ${providerCaptureId})`,
         triggeredBy: params.triggeredBy || 'PAYPAL_API',
-        metadata: { providerCaptureId, providerStatus },
+        metadata: { providerCaptureId, providerStatus, capturedAmountMinor, capturedCurrency },
       });
 
-      // 2. Update payment details
+      // Update payment details
       await tx.payment.update({
         where: { id: payment.id },
         data: {
@@ -252,8 +319,7 @@ export class PaymentService {
         },
       });
 
-      // 3. Post Double-Entry Ledger Journal
-      // Debit: PAYPAL_CLEARING, Credit: MERCHANT_PAYABLE
+      // Post Double-Entry Ledger Journal (PAYPAL_CLEARING Dr, MERCHANT_PAYABLE Cr)
       await LedgerService.recordCaptureJournal(tx, {
         paymentId: payment.id,
         amountMinor: payment.amountMinor,
@@ -261,7 +327,7 @@ export class PaymentService {
         providerCaptureId,
       });
 
-      // 4. Update parent order to COMPLETED
+      // Update parent order to COMPLETED
       await tx.order.update({
         where: { id: payment.orderId },
         data: { status: OrderStatus.COMPLETED },
@@ -273,6 +339,8 @@ export class PaymentService {
 
   /**
    * 3. Process Full or Partial Refund
+   * Enforces row-level lock against concurrent partial refunds, verifies actual PayPal
+   * refund response, prevents excess refunds, and posts ledger entries only after confirmed refund.
    */
   public static async refundPayment(params: {
     paymentId: string;
@@ -281,101 +349,188 @@ export class PaymentService {
     idempotencyKey?: string;
     triggeredBy?: string;
   }) {
-    const payment = await prisma.payment.findUnique({
-      where: { id: params.paymentId },
-      include: { refunds: true },
-    });
-
-    if (!payment) {
-      throw new NotFoundError(`Payment "${params.paymentId}" not found`);
-    }
-
-    if (
-      payment.status !== PaymentStatus.COMPLETED &&
-      payment.status !== PaymentStatus.PARTIALLY_REFUNDED
-    ) {
-      throw new BadRequestError(
-        `Only COMPLETED or PARTIALLY_REFUNDED payments can be refunded. Current status: "${payment.status}"`
-      );
-    }
-
-    if (!payment.providerCaptureId) {
-      throw new BadRequestError('Payment is missing PayPal Capture ID needed for refund');
-    }
-
-    const availableRefundable = payment.amountMinor - payment.refundedAmountMinor;
-    if (availableRefundable <= 0) {
-      throw new BadRequestError('This transaction is already fully refunded');
-    }
-
-    const requestedRefund = params.amountMinor ?? availableRefundable;
-
-    if (requestedRefund <= 0 || !Number.isInteger(requestedRefund)) {
-      throw new BadRequestError(`Invalid refund amount minor units: ${requestedRefund}`);
-    }
-
-    if (requestedRefund > availableRefundable) {
-      throw new BadRequestError(
-        `Requested refund amount (${requestedRefund}) exceeds remaining refundable balance (${availableRefundable})`
-      );
-    }
-
     const refundIdempotency =
       params.idempotencyKey || `IDEM-REF-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
-    // Call PayPal refund API
+    // 1. Database row-level lock and validation of remaining refundable balance
+    const payment = await prisma.$transaction(async (tx) => {
+      const [lockedPayment] = await tx.$queryRaw<Array<{
+        id: string;
+        orderId: string;
+        amountMinor: number;
+        refundedAmountMinor: number;
+        currency: string;
+        status: PaymentStatus;
+        providerCaptureId: string | null;
+      }>>`
+        SELECT id, "orderId", "amountMinor", "refundedAmountMinor", currency, status, "providerCaptureId"
+        FROM payments
+        WHERE id = ${params.paymentId}
+        FOR UPDATE
+      `;
+
+      if (!lockedPayment) {
+        throw new NotFoundError(`Payment "${params.paymentId}" not found`);
+      }
+
+      if (
+        lockedPayment.status !== PaymentStatus.COMPLETED &&
+        lockedPayment.status !== PaymentStatus.PARTIALLY_REFUNDED
+      ) {
+        throw new BadRequestError(
+          `Only COMPLETED or PARTIALLY_REFUNDED payments can be refunded. Current status: "${lockedPayment.status}"`
+        );
+      }
+
+      if (!lockedPayment.providerCaptureId) {
+        throw new BadRequestError('Payment is missing PayPal Capture ID needed for refund');
+      }
+
+      // Check if refund with this idempotency key already exists
+      const existingRefund = await tx.refund.findFirst({
+        where: {
+          paymentId: lockedPayment.id,
+          idempotencyKey: refundIdempotency,
+        },
+      });
+
+      if (existingRefund) {
+        return { lockedPayment, existingRefund };
+      }
+
+      const availableRefundable = lockedPayment.amountMinor - lockedPayment.refundedAmountMinor;
+      if (availableRefundable <= 0) {
+        throw new BadRequestError('This transaction is already fully refunded');
+      }
+
+      const requestedRefund = params.amountMinor ?? availableRefundable;
+
+      if (requestedRefund <= 0 || !Number.isInteger(requestedRefund)) {
+        throw new BadRequestError(`Invalid refund amount minor units: ${requestedRefund}`);
+      }
+
+      if (requestedRefund > availableRefundable) {
+        throw new BadRequestError(
+          `Requested refund amount (${requestedRefund}) exceeds remaining refundable balance (${availableRefundable})`
+        );
+      }
+
+      return { lockedPayment, requestedRefund };
+    });
+
+    // If already executed with this idempotency key, return existing
+    if ('existingRefund' in payment && payment.existingRefund) {
+      return {
+        refund: payment.existingRefund,
+        payment: await this.getPaymentById(payment.lockedPayment.id),
+      };
+    }
+
+    const { lockedPayment, requestedRefund } = payment as {
+      lockedPayment: {
+        id: string;
+        orderId: string;
+        amountMinor: number;
+        refundedAmountMinor: number;
+        currency: string;
+        status: PaymentStatus;
+        providerCaptureId: string;
+      };
+      requestedRefund: number;
+    };
+
+    // 2. Call PayPal refund API
     const refundRes = await payPalClient.refundCapture({
-      providerCaptureId: payment.providerCaptureId,
+      providerCaptureId: lockedPayment.providerCaptureId,
       amountMinor: requestedRefund,
-      currency: payment.currency,
+      currency: lockedPayment.currency,
       reason: params.reason,
       idempotencyKey: refundIdempotency,
     });
 
-    const isFullRefund = payment.refundedAmountMinor + requestedRefund >= payment.amountMinor;
-    const targetStatus = isFullRefund ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
+    // 3. Verify actual PayPal refund response
+    if (!refundRes || !refundRes.id) {
+      throw new BadRequestError('PayPal did not return a valid refund reference ID');
+    }
 
-    // Atomically record refund, state transition, and ledger reversal journal
+    if (refundRes.status !== 'COMPLETED') {
+      throw new BadRequestError(
+        `PayPal refund was not completed: provider returned status "${refundRes.status || 'UNKNOWN'}"`
+      );
+    }
+
+    // Validate confirmed refund amount and currency
+    const confirmedRefundMinor = dollarsToCents(refundRes.amount?.value || '0');
+    const confirmedCurrency = refundRes.amount?.currency_code || lockedPayment.currency;
+
+    if (confirmedRefundMinor !== requestedRefund || confirmedCurrency !== lockedPayment.currency) {
+      throw new BadRequestError(
+        `PayPal refund amount or currency mismatch: requested ${requestedRefund} ${lockedPayment.currency}, confirmed ${confirmedRefundMinor} ${confirmedCurrency}`
+      );
+    }
+
+    // 4. Atomically record confirmed refund, update balances, and post ledger reversal
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Record refund in database
+      // Re-lock payment to update refunded balance safely
+      const [currentPayment] = await tx.$queryRaw<Array<{
+        id: string;
+        amountMinor: number;
+        refundedAmountMinor: number;
+      }>>`
+        SELECT id, "amountMinor", "refundedAmountMinor"
+        FROM payments
+        WHERE id = ${lockedPayment.id}
+        FOR UPDATE
+      `;
+
+      const available = currentPayment.amountMinor - currentPayment.refundedAmountMinor;
+      if (confirmedRefundMinor > available) {
+        throw new BadRequestError(
+          `Refund of ${confirmedRefundMinor} exceeds remaining available balance of ${available}`
+        );
+      }
+
+      const isFullRefund = currentPayment.refundedAmountMinor + confirmedRefundMinor >= currentPayment.amountMinor;
+      const targetStatus = isFullRefund ? PaymentStatus.REFUNDED : PaymentStatus.PARTIALLY_REFUNDED;
+
+      // 1. Record refund in database with COMPLETED status
       const refundRecord = await tx.refund.create({
         data: {
-          paymentId: payment.id,
+          paymentId: lockedPayment.id,
           idempotencyKey: refundIdempotency,
           providerRefundId: refundRes.id,
-          amountMinor: requestedRefund,
-          currency: payment.currency,
+          amountMinor: confirmedRefundMinor,
+          currency: confirmedCurrency,
           reason: params.reason,
           status: RefundStatus.COMPLETED,
           rawProviderData: refundRes as any,
         },
       });
 
-      // 2. Update payment refunded amount
+      // 2. Increment payment refunded amount
       await tx.payment.update({
-        where: { id: payment.id },
+        where: { id: lockedPayment.id },
         data: {
-          refundedAmountMinor: { increment: requestedRefund },
+          refundedAmountMinor: { increment: confirmedRefundMinor },
         },
       });
 
       // 3. Advance state machine
-      await PaymentStateMachine.transition(tx, payment.id, targetStatus, {
-        reason: `Refund of ${requestedRefund} processed (PayPal Refund ID: ${refundRes.id})`,
+      await PaymentStateMachine.transition(tx, lockedPayment.id, targetStatus, {
+        reason: `Refund of ${confirmedRefundMinor} confirmed by PayPal (Refund ID: ${refundRes.id})`,
         triggeredBy: params.triggeredBy || 'SYSTEM',
         metadata: {
           refundId: refundRecord.id,
           providerRefundId: refundRes.id,
-          requestedRefund,
+          confirmedRefundMinor,
         },
       });
 
-      // 4. Post Ledger Reversal Journal
-      // Debit: MERCHANT_PAYABLE, Credit: PAYPAL_CLEARING
+      // 4. Post Ledger Reversal Journal ONLY after confirmed refund
       await LedgerService.recordRefundJournal(tx, {
         refundId: refundRecord.id,
-        amountMinor: requestedRefund,
-        currency: payment.currency,
+        amountMinor: confirmedRefundMinor,
+        currency: confirmedCurrency,
         providerRefundId: refundRes.id,
         reason: params.reason,
       });
@@ -383,7 +538,7 @@ export class PaymentService {
       // 5. If fully refunded, mark Order as REFUNDED
       if (isFullRefund) {
         await tx.order.update({
-          where: { id: payment.orderId },
+          where: { id: lockedPayment.orderId },
           data: { status: OrderStatus.REFUNDED },
         });
       }
@@ -393,7 +548,7 @@ export class PaymentService {
 
     return {
       refund: result,
-      payment: await this.getPaymentById(payment.id),
+      payment: await this.getPaymentById(lockedPayment.id),
     };
   }
 

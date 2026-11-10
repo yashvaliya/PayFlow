@@ -73,8 +73,30 @@ export class PayPalClient {
       env.PAYPAL_CLIENT_ID &&
         env.PAYPAL_CLIENT_SECRET &&
         !env.PAYPAL_CLIENT_ID.includes('placeholder') &&
-        !env.PAYPAL_CLIENT_SECRET.includes('placeholder')
+        !env.PAYPAL_CLIENT_SECRET.includes('placeholder') &&
+        env.PAYPAL_CLIENT_ID.length > 5
     );
+  }
+
+  /**
+   * Mock mode is strictly prohibited in production.
+   * Allowed ONLY in development/test when explicitly enabled via PAYPAL_ALLOW_MOCK or test runner.
+   */
+  public isMockAllowed(): boolean {
+    if (env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production') {
+      return false;
+    }
+    return Boolean(env.PAYPAL_ALLOW_MOCK || env.NODE_ENV === 'test' || process.env.NODE_ENV === 'test');
+  }
+
+  private ensureConfiguredOrMock(operation: string): void {
+    if (!this.isConfigured() && !this.isMockAllowed()) {
+      throw new AppError(
+        `PayPal credentials are not configured. Cannot execute ${operation} without valid API keys.`,
+        503,
+        'PAYPAL_NOT_CONFIGURED'
+      );
+    }
   }
 
   /**
@@ -87,7 +109,13 @@ export class PayPalClient {
     }
 
     if (!this.isConfigured()) {
-      // In development/test mock mode without credentials
+      if (!this.isMockAllowed()) {
+        throw new AppError(
+          'PayPal credentials are not configured and mock mode is disabled.',
+          503,
+          'PAYPAL_NOT_CONFIGURED'
+        );
+      }
       return 'mock_sandbox_access_token_' + Date.now();
     }
 
@@ -134,10 +162,11 @@ export class PayPalClient {
     cancelUrl?: string;
     idempotencyKey?: string;
   }): Promise<PayPalOrderResponse> {
+    this.ensureConfiguredOrMock('createOrder');
+
     const dollarValue = centsToDollars(params.amountMinor);
 
     if (!this.isConfigured()) {
-      // Simulated sandbox order for offline or testing mode
       const mockId = `MOCK-ORD-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       return {
         id: mockId,
@@ -214,9 +243,21 @@ export class PayPalClient {
   public async captureOrder(params: {
     providerOrderId: string;
     idempotencyKey?: string;
+    expectedAmountMinor?: number;
+    expectedCurrency?: string;
   }): Promise<PayPalCaptureResponse> {
+    this.ensureConfiguredOrMock('captureOrder');
+
     if (!this.isConfigured() || params.providerOrderId.startsWith('MOCK-')) {
+      if (!this.isMockAllowed()) {
+        throw new AppError('Mock payments are not supported in production mode', 400, 'MOCK_NOT_ALLOWED');
+      }
       const mockCaptureId = `MOCK-CAP-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+      const amountValue = params.expectedAmountMinor !== undefined
+        ? centsToDollars(params.expectedAmountMinor)
+        : '99.00';
+      const currencyValue = params.expectedCurrency || 'USD';
+
       return {
         id: params.providerOrderId,
         status: 'COMPLETED',
@@ -228,8 +269,8 @@ export class PayPalClient {
                   id: mockCaptureId,
                   status: 'COMPLETED',
                   amount: {
-                    currency_code: 'USD',
-                    value: '99.00',
+                    currency_code: currencyValue,
+                    value: amountValue,
                   },
                 },
               ],
@@ -270,7 +311,7 @@ export class PayPalClient {
     if (!res.ok) {
       throw new AppError(
         `PayPal capture failed (${res.status}): ${JSON.stringify(body)}`,
-        502,
+        res.status === 422 ? 422 : 502,
         'PAYPAL_CAPTURE_FAILED',
         body
       );
@@ -289,7 +330,12 @@ export class PayPalClient {
     reason?: string;
     idempotencyKey?: string;
   }): Promise<PayPalRefundResponse> {
+    this.ensureConfiguredOrMock('refundCapture');
+
     if (!this.isConfigured() || params.providerCaptureId.startsWith('MOCK-')) {
+      if (!this.isMockAllowed()) {
+        throw new AppError('Mock refunds are not supported in production mode', 400, 'MOCK_NOT_ALLOWED');
+      }
       const mockRefundId = `MOCK-REF-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       return {
         id: mockRefundId,
@@ -350,7 +396,12 @@ export class PayPalClient {
    * Retrieves order details from PayPal for reconciliation
    */
   public async getOrderDetails(providerOrderId: string): Promise<any> {
+    this.ensureConfiguredOrMock('getOrderDetails');
+
     if (!this.isConfigured() || providerOrderId.startsWith('MOCK-')) {
+      if (!this.isMockAllowed()) {
+        throw new AppError('Mock orders not allowed in production', 400, 'MOCK_NOT_ALLOWED');
+      }
       return {
         id: providerOrderId,
         status: 'COMPLETED',
@@ -389,7 +440,12 @@ export class PayPalClient {
    * Retrieves capture details from PayPal for reconciliation
    */
   public async getCaptureDetails(providerCaptureId: string): Promise<any> {
+    this.ensureConfiguredOrMock('getCaptureDetails');
+
     if (!this.isConfigured() || providerCaptureId.startsWith('MOCK-')) {
+      if (!this.isMockAllowed()) {
+        throw new AppError('Mock captures not allowed in production', 400, 'MOCK_NOT_ALLOWED');
+      }
       return {
         id: providerCaptureId,
         status: 'COMPLETED',
@@ -425,6 +481,7 @@ export class PayPalClient {
 
   /**
    * Verifies incoming PayPal Webhook Signature against PayPal API
+   * FAILS CLOSED if unconfigured or invalid.
    */
   public async verifyWebhookSignature(params: {
     authAlgo: string;
@@ -435,41 +492,67 @@ export class PayPalClient {
     webhookId: string;
     eventBody: any;
   }): Promise<boolean> {
+    // If not configured, FAIL CLOSED in production or when mock is disabled
     if (!this.isConfigured()) {
-      // If running without credentials, accept simulated sandbox webhooks
-      return true;
+      if (!this.isMockAllowed()) {
+        console.warn('Webhook signature verification rejected: PayPal credentials not configured (Fail Closed)');
+        return false;
+      }
+      // In test/mock mode, allow simulated verification unless explicitly marked invalid
+      if (params.transmissionSig === 'INVALID_SIGNATURE' || params.authAlgo === 'INVALID') {
+        console.warn('Webhook signature verification rejected: Invalid signature simulation');
+        return false;
+      }
+      return Boolean(params.eventBody && params.eventBody.id);
     }
 
-    const token = await this.getAccessToken();
-    const verifyPayload = {
-      auth_algo: params.authAlgo,
-      cert_url: params.certUrl,
-      transmission_id: params.transmissionId,
-      transmission_sig: params.transmissionSig,
-      transmission_time: params.transmissionTime,
-      webhook_id: params.webhookId || env.PAYPAL_WEBHOOK_ID,
-      webhook_event: params.eventBody,
-    };
-
-    const res = await fetch(
-      `${this.baseUrl}/v1/notifications/verify-webhook-signature`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(verifyPayload),
-      }
-    );
-
-    if (!res.ok) {
-      console.warn('PayPal webhook signature verification request returned non-200');
+    // Must have all required signature headers
+    if (
+      !params.authAlgo ||
+      !params.certUrl ||
+      !params.transmissionId ||
+      !params.transmissionSig ||
+      !params.transmissionTime
+    ) {
+      console.warn('Webhook signature verification rejected: Missing required signature headers');
       return false;
     }
 
-    const data = (await res.json()) as { verification_status: string };
-    return data.verification_status === 'SUCCESS';
+    try {
+      const token = await this.getAccessToken();
+      const verifyPayload = {
+        auth_algo: params.authAlgo,
+        cert_url: params.certUrl,
+        transmission_id: params.transmissionId,
+        transmission_sig: params.transmissionSig,
+        transmission_time: params.transmissionTime,
+        webhook_id: params.webhookId || env.PAYPAL_WEBHOOK_ID,
+        webhook_event: params.eventBody,
+      };
+
+      const res = await fetch(
+        `${this.baseUrl}/v1/notifications/verify-webhook-signature`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(verifyPayload),
+        }
+      );
+
+      if (!res.ok) {
+        console.warn(`PayPal webhook signature verification request returned HTTP ${res.status}`);
+        return false;
+      }
+
+      const data = (await res.json()) as { verification_status: string };
+      return data.verification_status === 'SUCCESS';
+    } catch (err) {
+      console.error('PayPal webhook signature verification request error:', err);
+      return false;
+    }
   }
 }
 
