@@ -4,56 +4,69 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
+    --background: 40 20% 98%;
+    --foreground: 225 35% 10%;
     --card: 0 0% 100%;
-    --card-foreground: 240 10% 3.9%;
+    --card-foreground: 225 35% 10%;
     --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 3.9%;
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
+    --popover-foreground: 225 35% 10%;
+    --primary: 38 92% 50%;
+    --primary-foreground: 225 35% 8%;
+    --secondary: 40 15% 94%;
+    --secondary-foreground: 225 30% 15%;
+    --muted: 40 12% 93%;
+    --muted-foreground: 225 15% 45%;
+    --accent: 38 90% 95%;
+    --accent-foreground: 38 92% 35%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 221.2 83.2% 53.3%;
+    --border: 40 15% 88%;
+    --input: 40 15% 88%;
+    --ring: 38 92% 50%;
     --radius: 0.625rem;
   }
 
   .dark {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 5.5%;
-    --card-foreground: 0 0% 98%;
-    --popover: 240 10% 5.5%;
-    --popover-foreground: 0 0% 98%;
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 240 3.7% 12%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 12%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 12%;
-    --accent-foreground: 0 0% 98%;
+    /* Royal Midnight Obsidian */
+    --background: 225 30% 6%;
+    --foreground: 45 25% 96%;
+    --card: 225 25% 8.5%;
+    --card-foreground: 45 25% 96%;
+    --popover: 225 25% 8.5%;
+    --popover-foreground: 45 25% 96%;
+    /* Royal Burnished Gold */
+    --primary: 43 92% 54%;
+    --primary-foreground: 225 35% 8%;
+    --secondary: 225 20% 13%;
+    --secondary-foreground: 45 20% 90%;
+    --muted: 225 20% 13%;
+    --muted-foreground: 225 15% 62%;
+    --accent: 43 50% 18%;
+    --accent-foreground: 43 92% 65%;
     --destructive: 0 62.8% 45.6%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 217.2 91.2% 59.8%;
+    --border: 225 18% 16%;
+    --input: 225 18% 16%;
+    --ring: 43 92% 54%;
   }
 }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
-  letter-spacing: -0.011em;
+  letter-spacing: -0.012em;
 }
 
 code, pre {
   font-family: 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace;
+}
+
+/* Luxurious Royal Gradients & Accents */
+.royal-glow {
+  background: radial-gradient(circle at 50% 0%, rgba(212, 175, 55, 0.12) 0%, rgba(30, 58, 138, 0.08) 40%, transparent 70%);
+}
+
+.gold-gradient-text {
+  background: linear-gradient(135deg, #f5d77f 0%, #d4af37 50%, #aa7c11 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
 }

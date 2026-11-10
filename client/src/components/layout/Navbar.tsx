@@ -41,10 +41,10 @@ export const Navbar: React.FC = () => {
           {/* Logo & Brand */}
           <div className="flex items-center gap-6">
             <Link to="/" className="flex items-center gap-2.5 font-bold tracking-tight text-foreground hover:opacity-90">
-              <div className="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-zinc-100 flex items-center justify-center text-white dark:text-zinc-900 shadow-sm">
+              <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-amber-500 via-amber-400 to-amber-600 flex items-center justify-center text-zinc-950 shadow-sm shadow-amber-500/20">
                 <CreditCard className="w-4 h-4" />
               </div>
-              <span className="font-extrabold text-xl text-foreground">
+              <span className="font-extrabold text-xl text-foreground tracking-tight">
                 PayFlow
               </span>
             </Link>
